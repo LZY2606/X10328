@@ -1,0 +1,23 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+    <PropertyGroup>
+        <TargetFramework>net11.0</TargetFramework>
+        <LangVersion>preview</LangVersion>
+        <IsTestProject>true</IsTestProject>
+        <UseMicrosoftTestingPlatformRunner>true</UseMicrosoftTestingPlatformRunner>
+        <TestingPlatformDotnetTestSupport>true</TestingPlatformDotnetTestSupport>
+        <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+        <WarningLevel>9999</WarningLevel>
+        <Nullable>enable</Nullable>
+        <ImplicitUsings>enable</ImplicitUsings>
+        <TieredCompilation>false</TieredCompilation>
+        <IsPackable>false</IsPackable>
+        <SignAssembly>true</SignAssembly>
+        <DelaySign>false</DelaySign>
+        <AssemblyOriginatorKeyFile>../SigningKey.snk</AssemblyOriginatorKeyFile>
+    </PropertyGroup>
+    <ItemGroup>
+        <PackageReference Include="TUnit" Version="1.68.17" />
+        <ProjectReference Include="..\CsCheck\CsCheck.csproj" />
+        <Using Include="TUnit.Assertions.Enums" />
+    </ItemGroup>
+</Project>

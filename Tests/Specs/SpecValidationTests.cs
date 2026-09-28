@@ -1,0 +1,1552 @@
+namespace Tests.Specs;
+
+using System.Text.RegularExpressions;
+using System.Threading.Tasks;
+using CsCheck;
+
+/// <summary>The mistakes a specification can contain that would otherwise pass silently and prove nothing. Each of
+/// these is rejected before any exploration starts, because the failure mode is a green test rather than a red one:
+/// a requirement that never fires, or a coverage row credited to the wrong requirement.</summary>
+public partial class SpecValidationTests
+{
+    static Spec<int> Counter() => Spec.From(0).Action("Inc", i => i + 1);
+
+    private record S(int V);
+
+    [Test]
+    public async Task Mermaid_CurlyBraces_In_Record_ToString_Are_Escaped()
+    {
+        var mermaid = Spec.From(new S(0)).Action("Inc", s => new S(s.V + 1)).Mermaid();
+        await Assert.That(mermaid).Contains("&#123;");
+        await Assert.That(mermaid).DoesNotContain("S { V");
+    }
+
+    [Test]
+    public async Task Duplicate_Requirement_Id_Is_Rejected()
+    {
+        var spec = Counter()
+            .Invariant("SAME", "first", i => i >= 0)
+            .Invariant("SAME", "second", i => i < 100);
+        var message = Assert.Throws<CsCheckException>(() => spec.Exhaustive(maxStates: 10))!.Message;
+        await Assert.That(message).Contains("SAME");
+    }
+
+    /// <summary>Two actions with the same name would cause on: and per: requirements to silently cover only the first,
+    /// leaving the second invisible to scoped requirements.</summary>
+    [Test]
+    public async Task Duplicate_Action_Name_Is_Rejected()
+    {
+        var spec = Spec.From(0).Action("Inc", i => i + 1).Action("Inc", i => i + 2);
+        var message = Assert.Throws<CsCheckException>(() => spec.Exhaustive(maxStates: 10))!.Message;
+        await Assert.That(message).Contains("Inc");
+    }
+
+    /// <summary>Two faults with the same name make CaughtBy and the Faults table credit the wrong row.</summary>
+    [Test]
+    public async Task Duplicate_Fault_Name_Is_Rejected()
+    {
+        var spec = Counter()
+            .Invariant("NON-NEGATIVE", "the counter never goes negative", i => i >= 0)
+            .Fault("same", (_, _) => false, (_, a) => a)
+            .Fault("same", (_, _) => false, (_, a) => a);
+        var message = Assert.Throws<CsCheckException>(() => spec.Exhaustive(maxStates: 10))!.Message;
+        await Assert.That(message).Contains("same");
+    }
+
+    /// <summary>If the spec already violates a requirement without any fault injected, every mutation would appear
+    /// "caught" regardless of whether it caused anything. Faults detects this and fails before running mutations.</summary>
+    [Test]
+    public async Task Faults_Rejects_A_Spec_That_Already_Fails()
+    {
+        var spec = Spec.From(0).Action("Inc", i => i < 4, i => i + 1)
+            .Never("NO-TWO", "the counter never reaches two", (_, a) => a == 2)
+            .Fault("irrelevant", (_, _) => false, (_, a) => a);
+        var message = Assert.Throws<CsCheckException>(() => spec.Faults())!.Message;
+        await Assert.That(message).Contains("NO-TWO");
+    }
+
+    /// <summary>SampleFaults also checks the baseline before injecting faults. The baseline for SampleFaults uses a
+    /// sampled walk rather than Exhaustive, so it is cost-proportional and checks exactly the traces that the fault
+    /// walks will later sample, closing the gap without paying for a full exhaustive search.</summary>
+    [Test]
+    public async Task SampleFaults_Rejects_A_Spec_That_Already_Fails()
+    {
+        var spec = Counter()
+            .Never("NO-TWO", "the counter never reaches two", (_, a) => a == 2)
+            .Fault("irrelevant", (_, _) => false, (_, a) => a);
+        var message = Assert.Throws<CsCheckException>(() => spec.SampleFaults())!.Message;
+        await Assert.That(message).Contains("NO-TWO");
+    }
+
+    /// <summary>A fault on a spec whose space does not close is inconclusive, not uncaught. If Faults gives up at
+    /// maxStates without finding a violation, it cannot claim the fault is undetectable; it only explored part of
+    /// the space. The fault shows as NOT CLOSED in the table and appears in Inconclusive rather than Uncaught, so
+    /// throwOnUncaught does not fire and the caller knows the result is not a proof.</summary>
+    [Test]
+    public async Task Faults_Reports_Inconclusive_When_Search_Does_Not_Close()
+    {
+        // Counter() is unbounded so Exhaustive gives up at maxStates without closing.
+        var report = Counter()
+            .Invariant("NON-NEGATIVE", "the counter never goes negative", i => i >= 0)
+            .Fault("a jump", (_, a) => a == 3, (_, a) => a + 1)
+            .Faults(maxStates: 5, throwOnUncaught: false);
+        await Assert.That(report.Uncaught).IsEmpty();
+        await Assert.That(report.Inconclusive).Contains("a jump");
+        await Assert.That(report.ToString()).Contains("NOT CLOSED");
+        await Assert.That(report.Results[0].Outcome).IsEqualTo(FaultOutcome.Inconclusive);
+    }
+
+    /// <summary>The Caught by column was measured against requirement ids only, so NOT CLOSED overflowed it whenever
+    /// every id was shorter than that label and the row it appeared on no longer lined up.</summary>
+    [Test]
+    public async Task Fault_Table_Lines_Up_With_A_Short_Requirement_Id()
+    {
+        var report = Counter()
+            .Invariant("OK", "the counter never goes negative", i => i >= 0)
+            .Fault("a jump", (_, a) => a == 3, (_, a) => a + 1)
+            .Faults(maxStates: 5, throwOnUncaught: false);
+        string header = "", row = "";
+        foreach (var line in report.ToString().Split('\n'))
+        {
+            if (line.Contains("| Fault ")) header = line;
+            else if (line.Contains("| a jump ")) row = line;
+        }
+        await Assert.That(header).IsNotEmpty();
+        await Assert.That(Pipes(row)).IsEqualTo(Pipes(header));
+
+        static string Pipes(string s)
+        {
+            var sb = new System.Text.StringBuilder();
+            for (int i = 0; i < s.Length; i++) if (s[i] == '|') sb.Append(i).Append(',');
+            return sb.ToString();
+        }
+    }
+
+    [Test]
+    public async Task Fault_On_Unknown_Action_Is_Rejected()
+    {
+        var spec = Counter()
+            .Invariant("NON-NEGATIVE", "the counter never goes negative", i => i >= 0)
+            .Fault("broken", on: "NoSuchAction", perturb: (_, a) => a - 10);
+        var message = Assert.Throws<CsCheckException>(() => spec.Faults())!.Message;
+        await Assert.That(message).Contains("NoSuchAction");
+    }
+
+    [Test]
+    public async Task Fault_On_ActionName_Is_Caught_When_That_Action_Fires()
+    {
+        var report = Spec.From(0)
+            .Action("Inc", i => i + 1)
+            .Action("Dec", i => i > 0, i => i - 1)
+            .Invariant("NON-NEGATIVE", "the counter never goes negative", i => i >= 0)
+            .Fault("inc-broken", on: "Inc", perturb: (before, _) => before - 1)
+            .Faults();
+        await Assert.That(report.CaughtBy("inc-broken")).IsEqualTo("NON-NEGATIVE");
+    }
+
+    [Test]
+    public async Task Fault_On_Disabled_Action_Is_Uncaught()
+    {
+        var report = Spec.From(0)
+            .Action("A", i => i < 3, i => i + 1)
+            .Action("B", _ => false, i => i - 100)
+            .Invariant("NON-NEGATIVE", "the counter never goes negative", i => i >= 0)
+            .Fault("b-broken", on: "B", perturb: (_, a) => a - 1000)
+            .Faults(throwOnUncaught: false);
+        await Assert.That(report.Uncaught).Contains("b-broken");
+    }
+
+    [Test]
+    public async Task Fault_On_ActionName_With_When_Predicate_Is_Caught()
+    {
+        var report = Spec.From(0)
+            .Action("Inc", i => i + 1)
+            .Invariant("NON-NEGATIVE", "the counter never goes negative", i => i >= 0)
+            .Fault("inc-overflow", on: "Inc", when: (_, a) => a > 5, perturb: (_, _) => -1)
+            .Faults();
+        await Assert.That(report.CaughtBy("inc-overflow")).IsEqualTo("NON-NEGATIVE");
+    }
+
+    [Test]
+    public async Task Conform_Omits_Generic_Type_Name_From_Report()
+    {
+        var spec = Counter();
+        var report = spec.Conform(create: () => (0, false), apply: (_, _) => true);
+        await Assert.That(report.ToString()).Contains("Spec.Conform to");
+        await Assert.That(report.ToString()).DoesNotContain("ValueTuple");
+    }
+
+    /// <summary>Sample writes its report from a finally, so a writeLine that throws there would replace the violation
+    /// the run exists to report with the sink's own failure.</summary>
+    [Test]
+    public async Task A_Throwing_WriteLine_Does_Not_Hide_A_Sampled_Violation()
+    {
+        var spec = Counter().Invariant("SMALL", "the counter stays below three", i => i < 3);
+        var message = Assert.Throws<CsCheckException>(
+            () => spec.Sample(_ => throw new InvalidOperationException("the sink is gone"), iter: 100))!.Message;
+        await Assert.That(message).Contains("SMALL");
+    }
+
+    /// <summary>Exhaustive writes its report immediately before throwing the violation, so a writeLine that throws
+    /// would pre-empt it and the run would fail for the wrong reason.</summary>
+    [Test]
+    public async Task A_Throwing_WriteLine_Does_Not_Hide_An_Exhaustive_Violation()
+    {
+        var spec = Spec.From(0)
+            .Action("Inc", i => i < 5, i => i + 1)
+            .Invariant("SMALL", "the counter stays below three", i => i < 3);
+        var message = Assert.Throws<CsCheckException>(
+            () => spec.Exhaustive(writeLine: _ => throw new InvalidOperationException("the sink is gone")))!.Message;
+        await Assert.That(message).Contains("SMALL");
+    }
+
+    /// <summary>The requirement, its detail and its quote need no printer, so a printer that throws must cost only the
+    /// trace and not which requirement failed.</summary>
+    [Test]
+    public async Task A_Throwing_Printer_Does_Not_Hide_Which_Requirement_Failed()
+    {
+        var spec = Spec.From(0)
+            .Print(_ => throw new InvalidOperationException("the printer blew up"))
+            .Action("Inc", i => i < 5, i => i + 1)
+            .Invariant("SMALL", "the counter stays below three", i => i < 3);
+        var message = Assert.Throws<CsCheckException>(() => spec.Exhaustive())!.Message;
+        await Assert.That(message).Contains("SMALL");
+        await Assert.That(message).Contains("could not be printed");
+    }
+
+    /// <summary>The deadlock trace is rendered before the report is written, so a printer that throws there would take
+    /// the whole report rather than just that one line.</summary>
+    [Test]
+    public async Task A_Throwing_Printer_Does_Not_Hide_The_Report_Of_A_Deadlock()
+    {
+        var report = Spec.From(0)
+            .Print(_ => throw new InvalidOperationException("the printer blew up"))
+            .Action("Inc", i => i < 5, i => i + 1)
+            .Exhaustive();
+        await Assert.That(report.Closed).IsTrue();
+        await Assert.That(report.DeadlockStates).IsEqualTo(1);
+        await Assert.That(report.ToString()).Contains("could not be printed");
+    }
+
+    [Test]
+    public async Task Unknown_On_Action_Is_Rejected()
+    {
+        var spec = Counter().Rule("R", "quote", on: "Increment", then: (b, a) => a > b);
+        var message = Assert.Throws<CsCheckException>(() => spec.Exhaustive(maxStates: 10))!.Message;
+        await Assert.That(message).Contains("Increment");
+    }
+
+    [Test]
+    public async Task Unknown_Per_Action_Is_Rejected()
+    {
+        var spec = Counter().Response("R", "quote", (_, a) => a == 1, (_, a) => a > 1, within: 2, per: "Clock");
+        var message = Assert.Throws<CsCheckException>(() => spec.Exhaustive(maxStates: 10))!.Message;
+        await Assert.That(message).Contains("Clock");
+    }
+
+    /// <summary>Mermaid gives up at a count that starts at one, so a non-positive cap would never match and an
+    /// unbounded model would walk until it ran out of memory instead of reporting that it gave up.</summary>
+    [Test]
+    public async Task Mermaid_MaxStates_Below_One_Is_Rejected()
+    {
+        var spec = Spec.From(0).Action("Inc", i => i < 5, i => i + 1);
+        var message = Assert.Throws<CsCheckException>(() => spec.Mermaid(maxStates: 0))!.Message;
+        await Assert.That(message).Contains("maxStates");
+    }
+
+    /// <summary>A Spec is frozen once an engine has run it. Without this, a Spec held in a static field and added to
+    /// by one test would silently change what every other test checked, and the order the tests happened to run in
+    /// would decide the result.</summary>
+    [Test]
+    public async Task Adding_To_A_Spec_After_Running_It_Is_Rejected()
+    {
+        var spec = Counter().Invariant("NON-NEGATIVE", "the counter never goes negative", i => i >= 0);
+        spec.Exhaustive(maxStates: 10);
+        var message = Assert.Throws<CsCheckException>(
+            () => spec.Invariant("LATE", "added too late", i => i < 5))!.Message;
+        await Assert.That(message).Contains("fresh Spec");
+    }
+
+    /// <summary>Deriving a variant from a fresh Spec is the supported pattern, and is what every example does.</summary>
+    [Test]
+    public async Task Deriving_A_Variant_From_A_Fresh_Spec_Is_Fine()
+    {
+        Counter().Invariant("A", "one", i => i >= 0).Exhaustive(maxStates: 10);
+        var report = Counter().Invariant("A", "one", i => i >= 0)
+                              .Invariant("B", "two", i => i < 1000)
+                              .Exhaustive(maxStates: 10);
+        await Assert.That(report.NeverTriggered).IsEmpty();
+    }
+
+    /// <summary>An unreachable Reachable requirement is only a failure once the space has closed, because that is the
+    /// only point at which unreachability can be concluded rather than guessed.</summary>
+    [Test]
+    public async Task Unreachable_Requirement_Fails_Once_The_Space_Closes()
+    {
+        var spec = Spec.From(0)
+            .Action("Inc", i => i < 3, i => i + 1)
+            .Reachable("TEN", "the counter can reach ten", i => i == 10);
+        spec.Exhaustive(out var violation);
+        await Assert.That(violation).IsNotNull();
+        await Assert.That(violation!.Id).IsEqualTo("TEN");
+        await Assert.That(violation.Detail).Contains("unreachable");
+    }
+
+    /// <summary>The same specification with the bound raised: the state is now reachable and nothing is reported.</summary>
+    [Test]
+    public async Task Reachable_Requirement_Passes_When_The_State_Is_Reached()
+    {
+        var report = Spec.From(0)
+            .Action("Inc", i => i < 10, i => i + 1)
+            .Reachable("TEN", "the counter can reach ten", i => i == 10)
+            .Exhaustive();
+        await Assert.That(report.Closed).IsTrue();
+        await Assert.That(report.NeverTriggered).IsEmpty();
+    }
+
+    /// <summary>A state carrying a value the behaviour never reads: Tag counts up without bound, and Equals and
+    /// GetHashCode are written to ignore it.</summary>
+    readonly record struct Tagged(int Step, int Tag)
+    {
+        public bool Equals(Tagged other) => Step == other.Step;
+        public override int GetHashCode() => Step;
+    }
+
+    [Test]
+    public async Task State_Equality_Decides_What_Counts_As_A_Distinct_State()
+    {
+        var report = Spec.From(new Tagged(0, 0))
+            .Action("Step", t => t.Step < 3, t => new Tagged(t.Step + 1, t.Tag + 1))
+            .Action("Churn", t => t with { Tag = t.Tag + 1 })
+            .Exhaustive(writeLine: TUnitX.WriteLine);
+        await Assert.That(report.Closed).IsTrue();
+        await Assert.That(report.States).IsEqualTo(4);
+    }
+
+    readonly record struct Wide(int Counter, bool Flag, int Small);
+
+    /// <summary>"Gave up at a million states" tells you nothing actionable, and finding the unbounded field by reading
+    /// the model is the main cliff in using any of this. The note now names the widest fields, sampled from the states
+    /// already reached, so the fix points at itself. Counter is unbounded, Flag has two values and Small three.</summary>
+    [Test]
+    public async Task Not_Closing_Names_The_Widest_State_Field()
+    {
+        var report = Spec.From(new Wide(0, false, 0))
+            .Action("Grow", w => w with { Counter = w.Counter + 1 })
+            .Action("Flip", w => w with { Flag = !w.Flag })
+            .Action("Bump", w => w with { Small = (w.Small + 1) % 3 })
+            .Exhaustive(maxStates: 2_000, writeLine: TUnitX.WriteLine);
+        await Assert.That(report.Closed).IsFalse();
+        await Assert.That(report.Note).Contains("widest state fields are Counter");
+        await Assert.That(report.Note!.IndexOf("Counter", StringComparison.Ordinal))
+            .IsLessThan(report.Note!.IndexOf("Small", StringComparison.Ordinal));
+        await Assert.That(report.Note).Contains("Flag (2 values)");
+        // The note as docs/Spec.md quotes it, wrapped there and one line here.
+        await Assert.That(report.Note).IsEqualTo(Docs.Unwrap(
+            Docs.Spec.Single(b => b.StartsWith("gave up at 2,000 states", StringComparison.Ordinal))));
+    }
+
+    /// <summary>A state with a hand written ToString cannot be parsed into fields, so the diagnostic is omitted rather
+    /// than guessed at, and the rest of the note is unchanged. This model is also honestly infinite rather than badly
+    /// abstracted, so it never revisits a state - which is why that clause of the note has to read as something to
+    /// check rather than as a diagnosis.</summary>
+    [Test]
+    public async Task Widest_Field_Diagnostic_Is_Omitted_When_It_Cannot_Parse()
+    {
+        var report = Spec.From(0).Action("Inc", i => i + 1).Exhaustive(maxStates: 100, writeLine: TUnitX.WriteLine);
+        await Assert.That(report.Closed).IsFalse();
+        await Assert.That(report.Note).Contains("gave up at 100 states");
+        await Assert.That(report.Note).DoesNotContain("widest");
+        await Assert.That(report.Note).Contains("no state was ever revisited");
+    }
+
+    /// <summary>The widest field diagnostic formats states with the user's printer, so a printer that throws on one of
+    /// them must lose the diagnostic rather than the whole report the caller asked not to throw.</summary>
+    [Test]
+    public async Task Widest_Field_Diagnostic_Survives_A_Throwing_Printer()
+    {
+        var report = Spec.From(new Wide(0, false, 0))
+            .Print(w => w.Counter == 50 ? throw new InvalidOperationException("printer blew up") : w.ToString())
+            .Action("Grow", w => w with { Counter = w.Counter + 1 })
+            .Exhaustive(maxStates: 200, throwOnViolation: false);
+        await Assert.That(report.Closed).IsFalse();
+        await Assert.That(report.Note).Contains("gave up at 200 states");
+        await Assert.That(report.Note).DoesNotContain("widest");
+    }
+
+    /// <summary>A model that only ever advances is legitimately a tree, so the note that observes it must not read as an
+    /// accusation. This eleven state chain has perfect value equality, and a chain is the first model anyone writes.
+    /// A model that does revisit says nothing at all, which is what keeps the note a signal rather than boilerplate.</summary>
+    [Test]
+    public async Task A_Tree_Shaped_Space_Is_Observed_Not_Blamed()
+    {
+        var chain = Spec.From(0).Action("Inc", i => i < 10, i => i + 1).Exhaustive(writeLine: TUnitX.WriteLine);
+        await Assert.That(chain.Closed).IsTrue();
+        await Assert.That(chain.States).IsEqualTo(11);
+        await Assert.That(chain.Revisits).IsEqualTo(0);
+        await Assert.That(chain.Note).Contains("the reachable space is a tree");
+        await Assert.That(chain.Note).Contains("expected if the model only advances");
+
+        var cycle = Spec.From(0).Action("Tick", i => (i + 1) % 12).Exhaustive();
+        await Assert.That(cycle.Closed).IsTrue();
+        await Assert.That(cycle.States).IsEqualTo(12);
+        await Assert.That(cycle.Revisits).IsEqualTo(1);
+        await Assert.That(cycle.Note).IsNull();
+    }
+
+    /// <summary>An unguarded counter has no finite state space, so maxStates is the only thing that stops it and the
+    /// run proves nothing. A Boundary closes it instead over a region chosen by the specification.</summary>
+    [Test]
+    public async Task Boundary_Closes_A_Space_That_Would_Otherwise_Run_Forever()
+    {
+        var unbounded = Spec.From(0).Action("Inc", i => i + 1).Exhaustive(maxStates: 500);
+        await Assert.That(unbounded.Closed).IsFalse();
+        await Assert.That(unbounded.Note).Contains("gave up");
+
+        var report = Spec.From(0).Action("Inc", i => i + 1).Boundary(i => i <= 5).Exhaustive(writeLine: TUnitX.WriteLine);
+        await Assert.That(report.Closed).IsTrue();
+        await Assert.That(report.States).IsEqualTo(6);
+        await Assert.That(report.Pruned).IsEqualTo(1);
+        // Read from docs/Spec.md rather than copied out of it, so editing either side alone fails.
+        await Assert.That(report.ToString()).Contains(Docs.Spec
+            .Single(b => b.StartsWith("state space CLOSED within boundary", StringComparison.Ordinal)).TrimEnd('\n'));
+    }
+
+    /// <summary>The property that makes a boundary worth having rather than just a smaller maxStates: the step that
+    /// leaves the boundary is still checked. Only the expansion of what it reached is given up, so a requirement the
+    /// exit transition violates is still found.</summary>
+    [Test]
+    public async Task Boundary_Still_Checks_The_Step_That_Leaves_It()
+    {
+        Spec.From(0)
+            .Action("Inc", i => i + 1)
+            .Boundary(i => i <= 5)
+            .Never("NO-SIX", "the counter never reaches six", (_, a) => a == 6)
+            .Exhaustive(out var violation);
+        await Assert.That(violation).IsNotNull();
+        await Assert.That(violation!.Id).IsEqualTo("NO-SIX");
+        await Assert.That(violation.Trace.Steps.Length).IsEqualTo(6);
+    }
+
+    /// <summary>And the conclusion a boundary is not allowed to support. Unreachability follows from closure, and a
+    /// pruned space has not closed over everything, so this reports a note instead of a violation.</summary>
+    [Test]
+    public async Task Boundary_Does_Not_Let_Reachable_Be_Called_Unreachable()
+    {
+        var report = Spec.From(0)
+            .Action("Inc", i => i + 1)
+            .Boundary(i => i <= 5)
+            .Reachable("TEN", "the counter can reach ten", i => i == 10)
+            .Exhaustive(out var violation, writeLine: TUnitX.WriteLine);
+        await Assert.That(violation).IsNull();
+        await Assert.That(report.Closed).IsTrue();
+        await Assert.That(report.Note).Contains("TEN");
+        await Assert.That(report.Note).Contains("not a failure");
+    }
+
+    /// <summary>A boundary that excludes the initial state would prune everything and report one state, closed - which
+    /// reads exactly like a proof.</summary>
+    [Test]
+    public async Task Boundary_Excluding_The_Initial_State_Is_Rejected()
+    {
+        var spec = Spec.From(0).Action("Inc", i => i + 1).Boundary(i => i > 3);
+        var message = Assert.Throws<CsCheckException>(() => spec.Exhaustive())!.Message;
+        await Assert.That(message).Contains("initial state");
+    }
+
+    /// <summary>The claim that makes bounded liveness sound here rather than best effort: an outstanding obligation is
+    /// part of the search state, so a cycle cannot discharge it by revisiting a state.
+    /// <para>This model has exactly two concrete states and Tick cycles between them, so the whole space is visited in two
+    /// steps. If the deadline were not part of the node key the frontier would empty with the obligation still owed
+    /// and nothing would be reported - which is precisely the unsoundness stateright documents for its eventually.
+    /// The violation being found at all is the property; the depth shows the deadline counting down across the cycle.</para></summary>
+    [Test]
+    public async Task Response_Obligation_Survives_A_Cycle()
+    {
+        Spec.From(0)
+            .Action("Tick", i => (i + 1) % 2)
+            .Response("NEVER-SETTLES", "entering one must be followed by settling",
+                trigger: (b, a) => b == 0 && a == 1,
+                response: (_, _) => false,
+                within: 3, per: "Tick")
+            .Exhaustive(out var violation, writeLine: TUnitX.WriteLine);
+        await Assert.That(violation).IsNotNull();
+        await Assert.That(violation!.Id).IsEqualTo("NEVER-SETTLES");
+        await Assert.That(violation.Trace.Steps.Length).IsEqualTo(4);
+    }
+
+    /// <summary>An Invariant already false before anything has happened has its own path: there is no transition to
+    /// blame, so the violation carries an empty trace and a step index of -1, and there is no state space to describe.
+    /// Every other violation test here goes through a step.</summary>
+    [Test]
+    public async Task Invariant_False_In_The_Initial_State_Is_Reported()
+    {
+        var report = Counter()
+            .Invariant("POSITIVE", "the counter is always positive", i => i > 0)
+            .Exhaustive(out var violation, writeLine: TUnitX.WriteLine);
+        await Assert.That(violation).IsNotNull();
+        await Assert.That(violation!.Id).IsEqualTo("POSITIVE");
+        await Assert.That(violation.Detail).Contains("initial state");
+        await Assert.That(violation.StepIndex).IsEqualTo(-1);
+        await Assert.That(violation.Trace.Steps).IsEmpty();
+        await Assert.That(report.States).IsEqualTo(0);
+
+        // The random engine reaches it through its own code path, and throws by default like the proof does.
+        var message = Assert.Throws<CsCheckException>(() => Counter()
+            .Invariant("POSITIVE", "the counter is always positive", i => i > 0).Sample())!.Message;
+        await Assert.That(message).Contains("POSITIVE");
+    }
+
+    /// <summary>cancel: discharges an obligation that was never going to be answered - a request withdrawn, a session
+    /// dropped before its confirming Logout. Elsewhere it is only exercised incidentally, and the way for it to be
+    /// wrong is to be ignored, which looks exactly like a passing test. So the same model is checked both ways.</summary>
+    [Test]
+    public async Task Response_Cancel_Discharges_The_Obligation()
+    {
+        // One is pending and two is its only successor, so without a cancel the deadline always expires.
+        static Spec<int> Waiting(Func<int, int, bool>? cancel) => Spec.From(0)
+            .Action("Raise", i => i == 0, _ => 1)
+            .Action("Abandon", i => i == 1, _ => 2)
+            .Response("ANSWERED", "a raised request is answered",
+                trigger: (_, a) => a == 1, response: (_, a) => a == 3, within: 1, cancel: cancel);
+
+        Waiting(null).Exhaustive(out var violation, writeLine: TUnitX.WriteLine);
+        await Assert.That(violation).IsNotNull();
+        await Assert.That(violation!.Id).IsEqualTo("ANSWERED");
+
+        var report = Waiting((_, a) => a == 2).Exhaustive(out var none, writeLine: TUnitX.WriteLine);
+        await Assert.That(none).IsNull();
+        await Assert.That(report.Closed).IsTrue();
+        await Assert.That(report.NeverTriggered).IsEmpty();
+    }
+
+    /// <summary>The other side of Faults_Throws_When_A_Defect_Escapes. With throwOnUncaught off an escape is a value to
+    /// read rather than an exception, so a whole table can be triaged at once instead of one fault per run.</summary>
+    [Test]
+    public async Task Faults_Reports_An_Uncaught_Defect_Without_Throwing()
+    {
+        var report = Spec.From(0)
+            .Action("Inc", i => i < 5, i => i + 1)
+            .Invariant("NON-NEGATIVE", "the counter never goes negative", i => i >= 0)
+            .Fault("counter advances twice", (_, _) => true, (_, a) => a + 1)
+            .Fault("counter goes negative", (_, _) => true, (_, _) => -1)
+            .Faults(TUnitX.WriteLine, throwOnUncaught: false);
+        await Assert.That(report.Uncaught.Count).IsEqualTo(1);
+        await Assert.That(report.Uncaught).Contains("counter advances twice");
+        await Assert.That(report.CaughtBy("counter advances twice")).IsNull();
+        await Assert.That(report.CaughtBy("counter goes negative")).IsEqualTo("NON-NEGATIVE");
+        await Assert.That(report.ToString()).Contains("NOTHING");
+    }
+
+    /// <summary>The same escape reported by the sampled engine, where it means something weaker: no requirement was
+    /// seen to detect the fault rather than that none can. The caveat line is in the table so the difference is on the
+    /// page next to the NOTHING it qualifies, and the exception says "in the walks sampled" for the same reason.</summary>
+    [Test]
+    public async Task SampleFaults_Reports_An_Uncaught_Defect()
+    {
+        var spec = Spec.From(0)
+            .Action("Inc", i => i < 5, i => i + 1)
+            .Invariant("NON-NEGATIVE", "the counter never goes negative", i => i >= 0)
+            .Fault("counter advances twice", (_, _) => true, (_, a) => a + 1)
+            .Fault("counter goes negative", (_, _) => true, (_, _) => -1);
+        var report = spec.SampleFaults(TUnitX.WriteLine, iter: 500, throwOnUncaught: false);
+        await Assert.That(report.CaughtBy("counter advances twice")).IsNull();
+        await Assert.That(report.CaughtBy("counter goes negative")).IsEqualTo("NON-NEGATIVE");
+        await Assert.That(report.ToString()).Contains("not that none exists");
+
+        var message = Assert.Throws<CsCheckException>(() => spec.SampleFaults(iter: 500))!.Message;
+        await Assert.That(message).Contains("in the walks sampled");
+    }
+
+    /// <summary>minSteps is the floor on generated trace length, so a property that only shows up after several steps is
+    /// not drowned in traces too short to reach it. The way for it to be wrong is to be ignored, which nothing else here
+    /// would notice. Checked on the generator, where lengths are visible, and through Sample, where the plumbing is.</summary>
+    [Test]
+    public async Task MinSteps_Sets_The_Shortest_Trace_Generated()
+    {
+        int shortest = int.MaxValue, longest = 0;
+        Spec.From(0).Action("Inc", i => i + 1).GenTrace(minSteps: 7, maxSteps: 9)
+            .Sample(trace =>
+            {
+                shortest = Math.Min(shortest, trace.Steps.Length);
+                longest = Math.Max(longest, trace.Steps.Length);
+            }, iter: 2_000, threads: 1);
+        await Assert.That(shortest).IsEqualTo(7);
+        await Assert.That(longest).IsEqualTo(9);
+
+        var report = Counter().Invariant("NON-NEGATIVE", "the counter never goes negative", i => i >= 0)
+            .Sample(TUnitX.WriteLine, minSteps: 7, maxSteps: 9, iter: 500);
+        await Assert.That(report.TracesWalked >= 500).IsTrue();
+        await Assert.That(report.StepsWalked >= report.TracesWalked * 7).IsTrue();
+        await Assert.That(report.StepsWalked <= report.TracesWalked * 9).IsTrue();
+    }
+
+    /// <summary>Response is about the steps after the trigger: a response holding on the trigger step itself does not
+    /// discharge the obligation. Pinned because it is stricter than the usual reading of leads-to and the opposite of
+    /// Precedes, so a same-step property written as a Response produces a counterexample that reads like a tool bug.
+    /// Such a property is a Rule, which is how the worked examples state theirs.</summary>
+    [Test]
+    public async Task Response_Is_Not_Discharged_On_The_Trigger_Step()
+    {
+        Spec.From(0)
+            .Action("Go", i => i < 4, i => i + 1)
+            .Response("SAME-STEP", "reaching one is answered by reaching one",
+                trigger: (_, a) => a == 1, response: (_, a) => a == 1, within: 1)
+            .Exhaustive(out var violation, writeLine: TUnitX.WriteLine);
+        await Assert.That(violation).IsNotNull();
+        await Assert.That(violation!.Id).IsEqualTo("SAME-STEP");
+
+        // Precedes, the other order form, is satisfied by one step holding both - "at or before it".
+        var report = Spec.From(0)
+            .Action("Go", i => i < 4, i => i + 1)
+            .Precedes("SAME-STEP", "reaching one is preceded by reaching one",
+                first: (_, a) => a == 1, second: (_, a) => a == 1)
+            .Exhaustive(out var none);
+        await Assert.That(none).IsNull();
+        await Assert.That(report.Closed).IsTrue();
+    }
+
+    /// <summary>Bounded existence: "at most three retries". Three are allowed and the fourth is a violation, reported
+    /// on the step that crosses the bound rather than at the end.</summary>
+    [Test]
+    public async Task AtMost_Allows_The_Bound_And_Fails_The_Next()
+    {
+        static Spec<int> Retries(int allowed) => Spec.From(0)
+            .Action("Retry", i => i < 4, i => i + 1)
+            .AtMost("AT-MOST-THREE", "at most three retries", allowed, (b, a) => a > b);
+
+        var ok = Retries(4).Exhaustive();
+        await Assert.That(ok.Closed).IsTrue();
+
+        Retries(3).Exhaustive(out var violation, writeLine: TUnitX.WriteLine);
+        await Assert.That(violation).IsNotNull();
+        await Assert.That(violation!.Id).IsEqualTo("AT-MOST-THREE");
+        await Assert.That(violation.Detail).Contains("more than 3 times");
+        await Assert.That(violation.Trace.Steps.Length).IsEqualTo(4);
+    }
+
+    /// <summary>The same soundness question as Response on a cycle, and the reason the count is in the search node
+    /// rather than a tally. Tick cycles between two states, so the whole space is two states and a count kept outside
+    /// the node would be discharged by revisiting one. The occurrences here are unbounded, so the bound must be
+    /// crossed on some path and the violation must be found.</summary>
+    [Test]
+    public async Task AtMost_Counts_Across_A_Cycle()
+    {
+        Spec.From(0)
+            .Action("Tick", i => (i + 1) % 2)
+            .AtMost("AT-MOST-TWICE", "at most twice", 2, (b, a) => b == 0 && a == 1)
+            .Exhaustive(out var violation, writeLine: TUnitX.WriteLine);
+        await Assert.That(violation).IsNotNull();
+        await Assert.That(violation!.Id).IsEqualTo("AT-MOST-TWICE");
+        await Assert.That(violation.Trace.Steps.Length).IsEqualTo(5);
+    }
+
+    /// <summary>Zero occurrences satisfies an AtMost, but silently, so it is reported as a NEVER in the coverage table
+    /// the way the other guarded forms are - otherwise "at most three retries" passes on a model that cannot retry.</summary>
+    [Test]
+    public async Task AtMost_Reports_Vacuity_When_It_Never_Occurs()
+    {
+        var report = Spec.From(0)
+            .Action("Stay", i => i)
+            .AtMost("AT-MOST-THREE", "at most three retries", 3, (b, a) => a > b)
+            .Exhaustive();
+        await Assert.That(report.Closed).IsTrue();
+        await Assert.That(report.NeverTriggered).Contains("AT-MOST-THREE");
+    }
+
+    /// <summary>A Rule with neither on: nor when: is the transition counterpart of an Invariant, and reports every step rather than a count - the count a when: of true produces looks like “how often the interesting case happened” but is only the number of steps evaluated.</summary>
+    [Test]
+    public async Task Rule_Over_Every_Step_Reports_Every_Step()
+    {
+        var report = Spec.From(0)
+            .Action("Inc", i => i < 4, i => i + 1)
+            .Rule("ADVANCES", "every step advances the counter by one", (b, a) => a == b + 1)
+            .Exhaustive(writeLine: TUnitX.WriteLine);
+        await Assert.That(report.Closed).IsTrue();
+        await Assert.That(report.NeverTriggered).IsEmpty();
+        await Assert.That(report.ToString()).Contains("| ADVANCES    |  every step |");
+
+        // The same claim with a when: of true is guarded, so it reports a number that means the same thing less clearly.
+        var guarded = Spec.From(0)
+            .Action("Inc", i => i < 4, i => i + 1)
+            .Rule("ADVANCES", "every step advances the counter by one", (_, _) => true, (b, a) => a == b + 1)
+            .Exhaustive();
+        await Assert.That(guarded.ToString()).Contains("| ADVANCES    |           4 |");
+
+        Spec.From(0)
+            .Action("Inc", i => i < 4, i => i + 1)
+            .Action("Jump", i => i == 0, _ => 2)
+            .Rule("ADVANCES", "every step advances the counter by one", (b, a) => a == b + 1)
+            .Exhaustive(out var violation);
+        await Assert.That(violation).IsNotNull();
+        await Assert.That(violation!.Detail).Contains("does not hold over the step");
+    }
+
+    /// <summary>Step numbers were padded to two characters, so a trace of a hundred steps or more lost its alignment.
+    /// The state lines follow the width so they stay level with the action names.</summary>
+    [Test]
+    public async Task Long_Traces_Stay_Aligned()
+    {
+        var lines = Walk(120).ToString().Split('\n');
+        await Assert.That(lines.Any(l => l.StartsWith("    120 Inc", StringComparison.Ordinal))).IsTrue();
+        await Assert.That(lines.Any(l => l.StartsWith("      1 Inc", StringComparison.Ordinal))).IsTrue();
+        // Action name and state both start in column 10 for a three digit trace.
+        await Assert.That(lines.Count(l => l.StartsWith("          ", StringComparison.Ordinal))).IsEqualTo(121);
+
+        await Assert.That(Walk(3).ToString().Split('\n')
+            .Any(l => l.StartsWith("     1 Inc", StringComparison.Ordinal))).IsTrue();
+
+        // The step count is pinned by minSteps and maxSteps, so any generated trace has exactly the length under test.
+        static Trace<int> Walk(int steps)
+        {
+            Trace<int> trace = null!;
+            Spec.From(0).Action("Inc", i => i + 1).GenTrace(minSteps: steps, maxSteps: steps)
+                .Sample(t => trace = t, iter: 1, threads: 1);
+            return trace;
+        }
+    }
+
+    /// <summary>Four positions and two laps, so a scope opened on the first lap can be shown to have closed before the
+    /// second one opens it again.</summary>
+    readonly record struct Lap(int Pos, int Count);
+
+    /// <summary>Dwyer's After-Until scope, the one cell of his catalogue these forms were missing: Precedes is already
+    /// Absence Before and NeverAfter is Absence After, but nothing said "not between one thing and the next, every time
+    /// round". Pos 1 opens the scope and Pos 3 closes it, twice.
+    /// <para>The three cases are only conclusive together. Closed proves until closes the scope, because the same predicate
+    /// with no until is a violation. Reopened then proves it reopens, because closed has already established that the
+    /// scope was shut when the second lap began, so nothing else can explain a violation inside it.</para></summary>
+    [Test]
+    public async Task NeverAfter_Until_Closes_The_Scope_And_Reopens_It()
+    {
+        static Spec<Lap> Scoped(Func<Lap, Lap, bool>? until, Func<Lap, Lap, bool> never) => Spec.From(new Lap(0, 0))
+            .Action("Step", l => l.Count < 2, l => l.Pos == 3 ? new Lap(0, l.Count + 1) : l with { Pos = l.Pos + 1 })
+            .NeverAfter("SCOPED", "never between position one and position three",
+                after: (_, a) => a.Pos == 1, never: never, until: until);
+
+        static bool ClosingStep(Lap _, Lap a) => a.Pos == 0 && a.Count == 1;   // reached from Pos 3, which closed it
+        static bool InsideSecond(Lap _, Lap a) => a.Pos == 2 && a.Count == 1;  // reached from Pos 1, which reopened it
+
+        var closed = Scoped((_, a) => a.Pos == 3, ClosingStep).Exhaustive(out var none, writeLine: TUnitX.WriteLine);
+        await Assert.That(none).IsNull();
+        await Assert.That(closed.Closed).IsTrue();
+
+        Scoped(null, ClosingStep).Exhaustive(out var unscoped);
+        await Assert.That(unscoped).IsNotNull();
+        await Assert.That(unscoped!.Detail).Contains("after the point");
+
+        Scoped((_, a) => a.Pos == 3, InsideSecond).Exhaustive(out var reopened, writeLine: TUnitX.WriteLine);
+        await Assert.That(reopened).IsNotNull();
+        await Assert.That(reopened!.Id).IsEqualTo("SCOPED");
+        await Assert.That(reopened.Detail).Contains("between the step that opens");
+        await Assert.That(reopened.Trace.Steps.Length).IsEqualTo(6);
+
+        // The over overload carries until through to each element's own scope.
+        var keyed = Spec.From(new Lap(0, 0))
+            .Action("Step", l => l.Count < 2, l => l.Pos == 3 ? new Lap(0, l.Count + 1) : l with { Pos = l.Pos + 1 })
+            .NeverAfter("SCOPED", "never between position one and position three", [0, 1],
+                after: (_, a, c) => a.Pos == 1 && a.Count == c,
+                never: (_, a, c) => a.Pos == 0 && a.Count == c + 1,
+                until: (_, a, c) => a.Pos == 3 && a.Count == c)
+            .Exhaustive(out var keyedViolation);
+        await Assert.That(keyedViolation).IsNull();
+        await Assert.That(keyed.ToString()).Contains("SCOPED[1]");
+    }
+
+    /// <summary>The deadline and history bits are packed into two ulongs, so exceeding the counts would silently
+    /// corrupt a proof rather than fail. Each limit is checked, including through the `over` overloads, which spend one
+    /// slot per element and so are the easy way to cross a limit without noticing.</summary>
+    [Test]
+    public async Task Requirement_Limits_Are_Enforced()
+    {
+        // Response and AtMost draw byte slots from one pool of sixteen spanning both counter words, so the budget can be
+        // spent in any mix. Twelve Responses and no AtMost is legal, which eight-of-each would have refused.
+        static Spec<int> Responses(int n)
+        {
+            var spec = Counter();
+            for (int i = 0; i < n; i++)
+                spec.Response($"R{i}", "quote", (_, a) => a == 1, (_, a) => a > 1, within: 2, per: "Inc");
+            return spec;
+        }
+        Responses(12).GenTrace(1, 1);
+        await Assert.That(Assert.Throws<CsCheckException>(() => Responses(17))!.Message)
+            .Contains("limit of 16 Response and AtMost");
+
+        // And mixed, which is the case the split budget could not express at all.
+        static Spec<int> Mixed(int responses, int atMosts)
+        {
+            var spec = Responses(responses);
+            for (int i = 0; i < atMosts; i++) spec.AtMost($"A{i}", "quote", 3, (b, a) => a > b);
+            return spec;
+        }
+        Mixed(10, 6).GenTrace(1, 1);
+        await Assert.That(Assert.Throws<CsCheckException>(() => Mixed(10, 7))!.Message)
+            .Contains("limit of 16 Response and AtMost");
+
+        static Spec<int> SeventeenOver() => Counter().Response("R", "quote",
+            [1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15, 16, 17],
+            (_, a, t) => a == t, (_, a, t) => a > t, within: 2, per: "Inc");
+        await Assert.That(Assert.Throws<CsCheckException>(() => SeventeenOver())!.Message)
+            .Contains("limit of 16 Response and AtMost");
+
+        await Assert.That(Assert.Throws<CsCheckException>(
+            () => Counter().Response("R", "q", (_, _) => true, (_, _) => true, within: 0, per: "Inc"))!.Message)
+            .Contains("within must be 1 to 254");
+        await Assert.That(Assert.Throws<CsCheckException>(
+            () => Counter().Response("R", "q", (_, _) => true, (_, _) => true, within: 255, per: "Inc"))!.Message)
+            .Contains("within must be 1 to 254");
+
+        static Spec<int> SixtyFive()
+        {
+            var spec = Counter();
+            for (int i = 0; i < 65; i++) spec.Precedes($"P{i}", "quote", (_, a) => a == 1, (_, a) => a > 1);
+            return spec;
+        }
+        await Assert.That(Assert.Throws<CsCheckException>(() => SixtyFive())!.Message).Contains("64 Precedes");
+
+        await Assert.That(Assert.Throws<CsCheckException>(() => Mixed(0, 17))!.Message)
+            .Contains("limit of 16 Response and AtMost");
+        await Assert.That(Assert.Throws<CsCheckException>(
+            () => Counter().AtMost("A", "q", 255, (_, _) => true))!.Message).Contains("times must be 0 to 254");
+    }
+
+    /// <summary>The reason coverage is counted per (action, argument) case and not per action. Set(2) is never enabled,
+    /// and the other two cases keep Set busy - so counting per action would report a healthy total and NeverFired could
+    /// not see the dead case at all. This is the argument-level half of the same problem: a busy total can hide a case that never ran.</summary>
+    [Test]
+    public async Task NeverFired_Detects_A_Dead_Argument_Case()
+    {
+        var report = Spec.From(0)
+            .Action("Set", [1, 2, 3], (_, v) => v != 2, (_, v) => v)
+            .Exhaustive(writeLine: TUnitX.WriteLine);
+        await Assert.That(report.Closed).IsTrue();
+        await Assert.That(string.Join(",", report.NeverFired)).IsEqualTo("Set(2)");
+        await Assert.That(report.ToString()).Contains("| Set(2)      |       NEVER |");
+        // The other two cases are busy, which is what would have hidden it.
+        await Assert.That(report.ToString()).Contains("| Set(1)      |");
+    }
+
+    /// <summary>The Response half of the shared slot pool. The AtMost test below covers the ninth slot's word selection
+    /// for a count; this covers it for a deadline, which is the more involved path - it decrements, can be cancelled and
+    /// is measured per action. Same model and bound as Response_Obligation_Survives_A_Cycle, so the four step
+    /// counterexample is directly comparable with the Response sitting in slot zero there.</summary>
+    [Test]
+    public async Task A_Response_Past_The_Eighth_Slot_Still_Expires()
+    {
+        var spec = Spec.From(0).Action("Tick", i => (i + 1) % 2);
+        for (int i = 0; i < 8; i++) spec.AtMost($"PAD{i}", "cannot occur", 3, (_, _) => false);
+        spec.Response("NINTH", "entering one must be followed by settling",
+            trigger: (b, a) => b == 0 && a == 1, response: (_, _) => false, within: 3, per: "Tick");
+        spec.Exhaustive(out var violation, writeLine: TUnitX.WriteLine);
+        await Assert.That(violation).IsNotNull();
+        await Assert.That(violation!.Id).IsEqualTo("NINTH");
+        await Assert.That(violation.Trace.Steps.Length).IsEqualTo(4);
+    }
+
+    /// <summary>Mermaid writes state labels into quoted strings, so a printer that emits quotes, pipes or newlines needs
+    /// escaping before the graph can render.</summary>
+    [Test]
+    public async Task Mermaid_Escapes_Label_Syntax()
+    {
+        var mermaid = Spec.From(0)
+            .Action("Step", i => i < 1, i => i + 1)
+            .Print(i => "say \"hi\" | " + i + "\nnext")
+            .Mermaid();
+        TUnitX.WriteLine(mermaid);
+        await Assert.That(mermaid).Contains("n0[\"say &quot;hi&quot; &#124; 0<br/>next\"]");
+    }
+
+    /// <summary>Escaping has to be exactly invertible, and the hand written test above only checks the characters
+    /// someone thought of - it passed while &lt; and &gt; went through raw. Two checks, because the round trip catches
+    /// a character escaped into something that no longer says what it said, and the strip catches one that reached the
+    /// label raw and so round trips trivially. The alphabet is dense in the structural characters, which
+    /// <c>Gen.String</c> over all of Unicode almost never produces.</summary>
+    [Test]
+    public void Mermaid_Label_Escaping_Round_Trips()
+    {
+        Gen.String["ab&<>\"|#;/\r\n"].Sample(text =>
+        {
+            var mermaid = Spec.From(0)
+                .Action("Step", [text], (i, _) => i < 1, (i, _) => i + 1)
+                .Print(_ => text)
+                .Mermaid();
+            var node = MyRegex.Match(mermaid);
+            var edge = MyRegex1.Match(mermaid);
+            // A raw newline splits the line in two and neither half matches, so this covers the newline forms as well.
+            if (!node.Success || !edge.Success) return false;
+            // Both line ending forms escape to the same <br/>, so the original cannot be recovered any more exactly.
+            return Unescape(node.Groups[1].Value) == text.Replace("\r\n", "\n").Replace("\r", "\n")
+                && NoRawSyntax(node.Groups[1].Value) && NoRawSyntax(edge.Groups[1].Value);
+        });
+
+        static string Unescape(string s) => s.Replace("<br/>", "\n")
+                                             .Replace("&#124;", "|")
+                                             .Replace("&quot;", "\"")
+                                             .Replace("&gt;", ">")
+                                             .Replace("&lt;", "<")
+                                             .Replace("&amp;", "&");
+
+        static bool NoRawSyntax(string label) => label
+            .Replace("&amp;", "").Replace("&lt;", "").Replace("&gt;", "")
+            .Replace("&quot;", "").Replace("&#124;", "").Replace("<br/>", "")
+            .IndexOfAny(['&', '<', '>', '"', '|', '\n', '\r']) < 0;
+    }
+
+
+    /// <summary>Merged edge labels used a non-empty argument name to decide the action takes arguments at all, so a
+    /// domain whose first element prints as empty dropped every later argument from the label.</summary>
+    [Test]
+    public async Task Mermaid_Merges_Arguments_That_Print_As_Empty()
+    {
+        var mermaid = Spec.From(0)
+            .Action("Set", ["", "y"], (i, _) => i == 0, (_, _) => 1)
+            .Mermaid(maxStates: 10);
+        TUnitX.WriteLine(mermaid);
+        await Assert.That(mermaid).Contains("n0 -->|\"Set(,y)\"| n1;");
+    }
+
+    [GeneratedRegex(@"^  n0\[""(.*)""\];$", RegexOptions.Multiline)]
+    private static partial Regex MyRegex { get; }
+
+    [GeneratedRegex(@"^  n0 -->\|""(.*)""\| n1;$", RegexOptions.Multiline)]
+    private static partial Regex MyRegex1 { get; }
+
+    /// <summary>A dead end needs no requirement to detect it, and that was only true of <see cref="Check.Exhaustive{S}(Spec{S}, int, int, int, bool, System.Action{string}?)">Exhaustive</see> - a sampled
+    /// walk stopped early and said nothing, so the engine you fall back to on a space too big to close was the one that
+    /// could not see the bug the other finds for free. Counted as walks, not states, since a sampled walk keeps no
+    /// visited set: <see cref="SpecReport.DeadlockStates">DeadlockStates</see> stays zero rather than being filled in with a number that would not mean
+    /// what it means for <see cref="Check.Exhaustive{S}(Spec{S}, int, int, int, bool, System.Action{string}?)">Exhaustive</see>.</summary>
+    [Test]
+    public async Task Sample_Reports_Walks_That_Dead_Ended()
+    {
+        var report = Spec.From(0)
+            .Action("Up", i => i < 3, i => i + 1)
+            .Action("Skip", i => i == 0, _ => 3)
+            .Sample(TUnitX.WriteLine, iter: 100);
+        await Assert.That(report.DeadlockTraces).IsGreaterThan(0);
+        await Assert.That(report.DeadlockStates).IsEqualTo(0);
+        await Assert.That(report.DeadlockTrace).IsNotNull();
+        await Assert.That(report.DeadlockTrace).Contains("no action enabled");
+        // Every walk leaves the initial state by one of two actions, so whichever is reported the first step has the
+        // other beside it - the alternatives come through on this path too.
+        await Assert.That(report.DeadlockTrace).Contains(" or ");
+    }
+
+    /// <summary>One line of the report carries this count for both engines.</summary>
+    [Test]
+    public async Task Conform_Reports_Walks_That_Dead_Ended()
+    {
+        var spec = Spec.From(0)
+            .Action("Up", i => i < 3, i => i + 1)
+            .Action("Skip", i => i == 0, _ => 3);
+        var report = spec.Conform(() => new int[1], (sut, t) => { sut[0] = t.After; return true; },
+            TUnitX.WriteLine, iter: 100);
+        await Assert.That(report.DeadlockTraces).IsGreaterThan(0);
+        await Assert.That(report.DeadlockTrace).IsNotNull();
+        // The number: any count ending in a zero contains "0 deadlocked".
+        await Assert.That(report.ToString()).Contains($"{report.DeadlockTraces:#,0} deadlocked");
+    }
+
+    /// <summary>The same walks with the end declared: nothing was enabled there either, so a count that only asked
+    /// whether the walk stopped early would report every completed walk as a dead end.</summary>
+    [Test]
+    public async Task Sample_Does_Not_Count_An_Intended_End_As_A_Dead_End()
+    {
+        var report = Spec.From(0)
+            .Action("Up", i => i < 3, i => i + 1)
+            .Action("Skip", i => i == 0, _ => 3)
+            .Terminal(i => i == 3)
+            .Sample(TUnitX.WriteLine, iter: 100);
+        await Assert.That(report.DeadlockTraces).IsEqualTo(0);
+        await Assert.That(report.DeadlockTrace).IsNull();
+    }
+
+    sealed class ConformSut { public int N; }
+
+    /// <summary>When apply returns a non-null string that reason appears in the failure trace so the divergence is
+    /// immediately clear without adding debug output to the apply function.</summary>
+    [Test]
+    public async Task Conform_String_Reason_Appears_In_Failure_Message()
+    {
+        var spec = Spec.From(0)
+            .Action("Inc", s => s < 3, s => s + 1)
+            .Invariant("ANY", "Always true.", _ => true);
+        var message = Assert.Throws<CsCheckException>(() => spec.Conform(
+            () => new int[1],
+            (sut, t) =>
+            {
+                sut[0] += 2; // bug: increments by 2 instead of 1
+                return sut[0] != t.After ? $"got {sut[0]}, expected {t.After}" : null;
+            },
+            writeLine: null))!.Message;
+        await Assert.That(message).Contains("Reason: got 2, expected 1");
+        await Assert.That(message).Contains("Trace:");
+    }
+
+    /// <summary>Conform surfaces a throwing model too, not just a throwing implementation.</summary>
+    [Test]
+    public async Task Conform_Surfaces_A_Model_That_Throws()
+    {
+        var spec = Spec.From(0)
+            .Action("Inc", s => s < 3, s => s == 2 ? throw new InvalidOperationException("effect boom") : s + 1)
+            .Invariant("ANY", "Always true.", _ => true);
+        var message = Assert.Throws<CsCheckException>(() => spec.Conform(() => new ConformSut(),
+            (sut, t) => { sut.N++; return sut.N == t.After; }, writeLine: null, minSteps: 3, maxSteps: 3, iter: 20))!.Message;
+        await Assert.That(message).Contains("effect boom");
+        await Assert.That(message).DoesNotContain("Object reference not set");
+    }
+
+    /// <summary>A model that throws surfaces its own exception rather than a NullReferenceException from the printer.</summary>
+    [Test]
+    public async Task Sample_Surfaces_A_Model_That_Throws()
+    {
+        var spec = Spec.From(0)
+            .Action("Inc", s => s < 3, s => s == 2 ? throw new InvalidOperationException("effect boom") : s + 1)
+            .Invariant("ANY", "Always true.", _ => true);
+        var message = Assert.Throws<CsCheckException>(
+            () => spec.Sample(writeLine: null, minSteps: 3, maxSteps: 3, iter: 20))!.Message;
+        await Assert.That(message).Contains("effect boom");
+        await Assert.That(message).DoesNotContain("Object reference not set");
+    }
+
+    /// <summary>Trace step bounds are rejected up front rather than crashing inside generation.</summary>
+    [Test]
+    [Arguments(4, 2)]
+    [Arguments(1, 0)]
+    [Arguments(-1, 3)]
+    [Arguments(-1, -1)]
+    public async Task Trace_Steps_Out_Of_Order_Are_Rejected(int minSteps, int maxSteps)
+    {
+        var spec = Spec.From(0)
+            .Action("Inc", s => s < 5, s => s + 1)
+            .Invariant("ANY", "Always true.", _ => true);
+        var message = Assert.Throws<CsCheckException>(
+            () => spec.Sample(writeLine: null, minSteps: minSteps, maxSteps: maxSteps, iter: 20))!.Message;
+        await Assert.That(message).Contains("minSteps <= maxSteps");
+        await Assert.That(message).DoesNotContain("Set seed");
+    }
+
+    [Test]
+    [Arguments(0, 0)]
+    [Arguments(0, 3)]
+    [Arguments(3, 3)]
+    public void Trace_Steps_In_Order_Are_Accepted(int minSteps, int maxSteps)
+    {
+        Spec.From(0)
+            .Action("Inc", s => s < 5, s => s + 1)
+            .Invariant("ANY", "Always true.", _ => true)
+            .Sample(writeLine: null, minSteps: minSteps, maxSteps: maxSteps, iter: 20);
+    }
+
+    record struct Stuck(bool Pending);
+
+    static Spec<Stuck> NeverAnswered() => Spec.From(new Stuck(false))
+        .Action("Request", s => !s.Pending, _ => new Stuck(true))
+        .Terminal(s => s.Pending)
+        .Response("MUST-ANSWER", "A request is answered within three steps.",
+            (b, a) => !b.Pending && a.Pending, (_, _) => false, within: 3);
+
+    /// <summary>Exhaustive reports an obligation still outstanding where a trace ends, as the sampled engines do.</summary>
+    [Test]
+    public async Task Exhaustive_Reports_An_Obligation_Outstanding_At_A_Trace_End()
+    {
+        var spec = NeverAnswered();
+        var exhaustive = spec.Exhaustive(out var violation, maxStates: 10_000, writeLine: null);
+        await Assert.That(violation).IsNull();
+        await Assert.That(exhaustive.Closed).IsTrue();
+        await Assert.That(exhaustive.RequirementUnresolved[0]).IsGreaterThan(0);
+        var sampled = NeverAnswered().Sample(writeLine: null, minSteps: 1, maxSteps: 4, iter: 20);
+        await Assert.That(sampled.RequirementUnresolved[0]).IsGreaterThan(0);
+    }
+
+    static Spec<int> Ring() => Spec.From(0)
+        .Action("Ring", i => i == 0, _ => 1)
+        .Action("Tick", i => i > 0, i => i + 1)
+        .Response("MUST-ANSWER", "A ring is answered within two ticks.",
+            (b, a) => a == 1 && b == 0, (_, a) => a == 99, within: 2);
+
+    /// <summary><see cref="Spec{S}.AtMost(string, string, int, Func{S, S, bool})">AtMost</see> marks every occurrence, including the one that broke the bound.</summary>
+    [Test]
+    [Arguments("MUST-ANSWER", "raised here", 1)]
+    [Arguments("NO-THIRD-RETRY", "counted", 3)]
+    [Arguments("NO-SEND-AFTER-CLOSE", "scope opens", 1)]
+    public async Task Violation_Marks_Where_The_Obligation_Started(string id, string word, int marks)
+    {
+        var spec = id switch
+        {
+            "MUST-ANSWER" => Ring(),
+            "NO-THIRD-RETRY" => Spec.From(0)
+                .Action("Retry", i => i < 5, i => i + 1)
+                .AtMost(id, "At most two retries.", 2, (b, a) => a > b),
+            _ => Spec.From(0)
+                .Action("Close", i => i == 0, _ => 1)
+                .Action("Send", i => i >= 1, i => i + 1)
+                .NeverAfter(id, "Nothing is sent once closed.",
+                    after: (b, a) => a == 1 && b == 0, never: (b, a) => a > b && b >= 1),
+        };
+        spec.Exhaustive(out var violation);
+        await Assert.That(violation).IsNotNull();
+        await Assert.That(violation!.Id).IsEqualTo(id);
+        var text = violation.ToString(i => $"state={i}");
+        TUnitX.WriteLine(text);
+        await Assert.That(Regex.Count(text, Regex.Escape(word))).IsEqualTo(marks);
+    }
+
+    /// <summary>The mark column is as wide as the longest action, so adding one moves it.</summary>
+    [Test]
+    public async Task Docs_Quote_The_Obligation_Marks()
+    {
+        Ring().Exhaustive(out var violation);
+        var quoted = Docs.Spec.Single(b => b.Contains("raised here", StringComparison.Ordinal));
+        await Assert.That(violation!.ToString(i => $"clock={i}")).Contains(quoted.TrimEnd('\n'));
+    }
+
+    /// <summary>Nothing earlier to point at, so no marks and no change of shape.</summary>
+    [Test]
+    public async Task Violation_On_One_Step_Is_Not_Marked()
+    {
+        Spec.From(0)
+            .Action("Inc", i => i < 4, i => i + 1)
+            .Never("NO-TWO", "the counter never reaches two", (_, a) => a == 2)
+            .Exhaustive(out var violation);
+        var text = violation!.ToString(i => $"state={i}");
+        TUnitX.WriteLine(text);
+        foreach (var line in text.Split('\n').Where(l => l.Contains(" Inc", StringComparison.Ordinal)))
+            await Assert.That(line).EndsWith("Inc");
+    }
+
+    /// <summary>A walk can miss a dead end; it must not invent one.</summary>
+    [Test]
+    public void Sampled_Engines_Do_Not_Invent_A_Dead_End()
+    {
+        Gen.Select(Gen.Int[2, 5], Gen.Int[1, 4], Gen.Bool)
+        .Sample((bound, stop, terminal) =>
+        {
+            Spec<int> Make()
+            {
+                var s = Spec.From(0)
+                    .Action("Up", i => i != stop, i => (i + 1) % bound)
+                    .Action("Jump", i => i == 0, _ => stop);
+                return terminal ? s.Terminal(i => i == stop) : s;
+            }
+            var exhaustive = Make().Exhaustive(maxStates: 64).DeadlockStates;
+            var sampled = Make().Sample(iter: 100).DeadlockTraces;
+            var conformed = Make().Conform(() => new int[1], (sut, t) => { sut[0] = t.After; return true; },
+                iter: 100).DeadlockTraces;
+            return (sampled == 0 || exhaustive > 0) && (conformed == 0 || exhaustive > 0);
+        });
+    }
+
+    /// <summary>"You could have done this instead" needs what you did to be absent from it.</summary>
+    [Test]
+    public void Alternatives_Never_Include_The_Step_Taken()
+    {
+        Gen.Select(Gen.Int[2, 4], Gen.Int[2, 5])
+        .Sample((args, bound) =>
+        {
+            var report = Spec.From(0)
+                .Action("A", Enumerable.Range(0, args).ToArray(), (n, _) => n < bound, (n, v) => (n + v + 1) % bound)
+                .Action("B", n => n == 1, _ => bound)
+                .Exhaustive(maxStates: 64);
+            if (report.DeadlockTrace is null) return true;
+            foreach (var line in report.DeadlockTrace.Split('\n'))
+            {
+                var or = line.IndexOf(" or ", StringComparison.Ordinal);
+                if (or < 0) continue;
+                var taken = line[..or].TrimStart().Split(' ', 2)[1].Trim();
+                foreach (var alternative in line[(or + 4)..].Split(", "))
+                    if (string.Equals(alternative.Trim(), taken, StringComparison.Ordinal)) return false;
+            }
+            return true;
+        });
+    }
+
+    /// <summary>A deadline outliving the trace is neither a pass nor a failure, and the row has to say so.</summary>
+    [Test]
+    public async Task Sample_Reports_An_Obligation_Outstanding_When_The_Trace_Ends()
+    {
+        var report = Spec.From(0)
+            .Action("Ring", i => i == 0, _ => 1)
+            .Action("Tick", i => i > 0, i => i + 1)
+            .Response("MUST-ANSWER", "A ring is answered within nine ticks.",
+                (b, a) => a == 1 && b == 0, (_, a) => a == 99, within: 9)
+            .Sample(TUnitX.WriteLine, maxSteps: 3, iter: 100);
+        // Nine steps of deadline cannot expire inside three, so nothing fails and the obligation is still owed.
+        await Assert.That(report.ToString()).Contains("MUST-ANSWER");
+        var row = report.ToString().Split('\n').Single(l => l.Contains("MUST-ANSWER", StringComparison.Ordinal));
+        await Assert.That(row.Split('|')[3].Trim()).IsNotEmpty();
+    }
+
+    /// <summary>The trace opens with the other key, so the wrong element would mark three where two are owed.</summary>
+    [Test]
+    public async Task Keyed_Marks_Belong_To_The_Element_That_Failed()
+    {
+        Spec.From(new Pair(0, 0))
+            .Print(p => $"a={p.A} b={p.B}")
+            // A needs a B first, so the shortest counterexample against CAP[0] has a B occurrence in it.
+            .Action("BumpA", p => p.B >= 1, p => p with { A = p.A + 1 })
+            .Action("BumpB", p => p.B == 0, p => p with { B = p.B + 1 })
+            .AtMost("CAP", "At most one bump each.", 1, [0, 1],
+                (b, a, k) => k == 0 ? a.A > b.A : a.B > b.B)
+            .Exhaustive(out var violation);
+        await Assert.That(violation).IsNotNull();
+        await Assert.That(violation!.Id).IsEqualTo("CAP[0]");
+        var text = violation.ToString(p => $"a={p.A} b={p.B}");
+        TUnitX.WriteLine(text);
+        await Assert.That(MyRegex2.Count(text)).IsEqualTo(2);
+    }
+
+    [GeneratedRegex("counted")]
+    private static partial Regex MyRegex2 { get; }
+
+    readonly record struct Pair(int A, int B);
+
+    /// <summary>A sampled violation is built on a different path from the exhaustive one.</summary>
+    [Test]
+    public async Task Sampled_Violation_Is_Marked()
+    {
+        var message = Assert.Throws<CsCheckException>(() => Ring().Sample(maxSteps: 12, iter: 1_000))!.Message;
+        TUnitX.WriteLine(message);
+        await Assert.That(message).Contains("raised here");
+    }
+
+    /// <summary>Arguments are rendered on the alternatives the same way they are on the step, and a state with a wide
+    /// domain is bounded so one line cannot run away with the report.</summary>
+    [Test]
+    public async Task Deadlock_Alternatives_Render_Arguments_And_Are_Bounded()
+    {
+        var report = Spec.From(0)
+            .Action("Set", Enumerable.Range(0, 12).ToArray(), (n, _) => n == 0, (_, v) => v)
+            .Exhaustive(writeLine: TUnitX.WriteLine);
+        await Assert.That(report.DeadlockStates).IsGreaterThan(0);
+        await Assert.That(report.DeadlockTrace)
+            .Contains("or Set(0), Set(2), Set(3), Set(4), Set(5), Set(6), Set(7), Set(8) +3 more");
+    }
+
+    /// <summary>A queue abstracted to its count, which is what picking the smallest falsifying domain produces: all
+    /// three Enqueue arguments reach the same state, so one arrow says what three identical ones were saying. Dequeue
+    /// shares no target with Enqueue here, so the two stay separate arrows.</summary>
+    [Test]
+    public async Task Mermaid_Merges_Arrows_To_The_Same_State()
+    {
+        var mermaid = Spec.From(0)
+            .Action("Enqueue", [1, 2, 3], (n, _) => n < 2, (n, _) => n + 1)
+            .Action("Dequeue", n => n > 0, n => n - 1)
+            .Mermaid();
+        TUnitX.WriteLine(mermaid);
+        await Assert.That(mermaid).Contains("n0 -->|\"Enqueue(1,2,3)\"| n1;");
+        await Assert.That(mermaid).Contains("n1 -->|\"Dequeue\"| n0;");
+        await Assert.That(MyRegex3.Count(mermaid)).IsEqualTo(4);
+        await Assert.That(mermaid).Contains("transitions: 8");
+    }
+
+
+    [GeneratedRegex(" -->\\|")]
+    private static partial Regex MyRegex3 { get; }
+
+    /// <summary>Two actions reaching one state share the arrow, and each keeps its own name.</summary>
+    [Test]
+    public async Task Mermaid_Merges_Arrows_From_Different_Actions()
+    {
+        var mermaid = Spec.From(0)
+            .Action("Cancel", n => n == 0, _ => 1)
+            .Action("Timeout", n => n == 0, _ => 1)
+            .Mermaid();
+        TUnitX.WriteLine(mermaid);
+        await Assert.That(mermaid).Contains("n0 -->|\"Cancel, Timeout\"| n1;");
+    }
+
+    /// <summary>Merging must lose nothing, which the examples above cannot show: they only check the labels someone
+    /// predicted. The arrows have to be exactly the distinct source-target pairs, and every argument of every enabled
+    /// action has to appear against the arrow that carried it - a merge that quietly dropped one would still draw a
+    /// plausible diagram. The domains overlap so that different arguments genuinely do share a target.</summary>
+    [Test]
+    public void Mermaid_Merging_Loses_No_Transition()
+    {
+        Gen.Select(Gen.Int[1, 4], Gen.Int[1, 4], Gen.Int[2, 4])
+        .Sample((aArgs, bArgs, bound) =>
+        {
+            var mermaid = Spec.From(0)
+                .Action("A", Enumerable.Range(0, aArgs).ToArray(), (n, v) => (n + v) % bound)
+                .Action("B", Enumerable.Range(0, bArgs).ToArray(), (n, v) => (n * 2 + v) % bound)
+                .Mermaid(maxStates: 64);
+            // Node ids are handed out in discovery order, not by state value, so the labels are the only way across.
+            var ids = MyRegex4.Matches(mermaid)
+                .ToDictionary(m => int.Parse(m.Groups[2].Value), m => m.Groups[1].Value);
+            var arrows = MyRegex5.Matches(mermaid);
+            // One arrow per source-target pair, or the merge did not merge.
+            var pairs = new HashSet<(string, string)>();
+            foreach (Match arrow in arrows)
+                if (!pairs.Add((arrow.Groups[1].Value, arrow.Groups[3].Value))) return false;
+            // Read every transition back out of the labels, so the set they describe can be compared with the model's.
+            var drawn = new HashSet<(string From, string Name, int Arg, string To)>();
+            foreach (Match arrow in arrows)
+                foreach (var segment in arrow.Groups[2].Value.Split(", "))
+                {
+                    var bracket = segment.IndexOf('(', StringComparison.Ordinal);
+                    if (bracket < 0) return false;
+                    foreach (var a in segment[(bracket + 1)..^1].Split(','))
+                        if (!drawn.Add((arrow.Groups[1].Value, segment[..bracket], int.Parse(a),
+                                        arrow.Groups[3].Value)))
+                            return false;
+                }
+            var expected = new HashSet<(string, string, int, string)>();
+            foreach (var (state, id) in ids)
+            {
+                for (int v = 0; v < aArgs; v++) expected.Add((id, "A", v, ids[(state + v) % bound]));
+                for (int v = 0; v < bArgs; v++) expected.Add((id, "B", v, ids[(state * 2 + v) % bound]));
+            }
+            return drawn.SetEquals(expected);
+        });
+    }
+
+    [GeneratedRegex(@"^  (n\d+)\[""(\d+)""\];$", RegexOptions.Multiline)]
+    private static partial Regex MyRegex4 { get; }
+
+    [GeneratedRegex(@"^  (n\d+) -->\|""(.*)""\| (n\d+);$", RegexOptions.Multiline)]
+    private static partial Regex MyRegex5 { get; }
+
+    /// <summary>The emitted Mermaid is text people copy into Markdown, so its stable shape is part of the API.</summary>
+    [Test]
+    public async Task Mermaid_Text_Output_Is_Stable()
+    {
+        var mermaid = Spec.From(0)
+            .Action("Step", i => i < 1, i => i + 1)
+            .Terminal(i => i == 1)
+            .Mermaid();
+        TUnitX.WriteLine(mermaid);
+        await Assert.That(mermaid).IsEqualTo(
+            """
+            flowchart LR
+              classDef initial stroke:#495057,stroke-width:2px,stroke-dasharray: 3 3;
+              classDef terminal stroke:#0b7285,stroke-width:4px;
+              classDef deadlock stroke:#c92a2a,stroke-width:4px;
+              classDef truncated stroke:#f08c00,stroke-width:4px,stroke-dasharray: 5 5;
+              classDef note stroke:#868e96,stroke-dasharray: 3 3;
+              start((start));
+              start --> n0;
+              class start initial;
+              n0 -->|"Step"| n1;
+              n0["0"];
+              n1["1"];
+              class n1 terminal;
+              info["states: 2<br/>transitions: 1<br/>depth: 1<br/>terminal: 1<br/>deadlock: 0"];
+              class info note;
+              subgraph legend["Legend"]
+                legendTerminal["terminal"];
+                legendDeadlock["deadlock"];
+                legendTruncated["truncated"];
+              end
+              class legendTerminal terminal;
+              class legendDeadlock deadlock;
+              class legendTruncated truncated;
+            """ + "\n");
+    }
+
+    /// <summary>A picture stops being useful long before a proof does, so Mermaid gives up at its own much smaller limit.
+    /// Every other Mermaid test draws a model well inside it, leaving the truncation path unrun - and it was wrong: the walk
+    /// stopped as soon as the cap was reached, so the last state discovered kept the edge that found it but never got a
+    /// label of its own. Every state that is pointed at must be declared.</summary>
+    [Test]
+    public async Task Mermaid_Truncates_At_MaxStates()
+    {
+        var mermaid = Spec.From(0).Action("Step", i => i < 10, i => i + 1).Mermaid(maxStates: 4);
+        TUnitX.WriteLine(mermaid);
+        await Assert.That(mermaid).Contains("truncatedNote[\"gave up at 4 states\"]");
+        // Four labels for four states, and three edges between them. Every n referenced by an edge is declared.
+        await Assert.That(MyRegex6.Count(mermaid)).IsEqualTo(4);
+        await Assert.That(MyRegex7.Count(mermaid)).IsEqualTo(3);
+        foreach (var to in MyRegex8.Matches(mermaid))
+            await Assert.That(mermaid).Contains(((Match)to).Groups[1].Value + "[\"");
+        // The state whose successor was dropped is dashed, so it cannot be read as an intended end or a dead one.
+        await Assert.That(MyRegex9.Count(mermaid)).IsEqualTo(1);
+        await Assert.That(MyRegex10.Count(mermaid)).IsEqualTo(0);
+        await Assert.That(mermaid).EndsWith("\n");
+    }
+
+
+    [GeneratedRegex(@"n\d+\[""\d")]
+    private static partial Regex MyRegex6 { get; }
+
+    [GeneratedRegex(" -->\\|")]
+    private static partial Regex MyRegex7 { get; }
+
+    [GeneratedRegex(@" -->\|""[^""]+""\| (n\d+)")]
+    private static partial Regex MyRegex8 { get; }
+
+    [GeneratedRegex(@"class n\d+ truncated")]
+    private static partial Regex MyRegex9 { get; }
+
+    [GeneratedRegex(@"class n\d+ deadlock")]
+    private static partial Regex MyRegex10 { get; }
+
+    /// <summary>The note says an edge was dropped, so a model that happens to be exactly the size of the cap and was
+    /// drawn in full must not claim it gave up.</summary>
+    [Test]
+    public async Task Mermaid_Exactly_At_MaxStates_Is_Not_Truncated()
+    {
+        var mermaid = Spec.From(0).Action("Step", i => i < 3, i => i + 1).Mermaid(maxStates: 4);
+        TUnitX.WriteLine(mermaid);
+        await Assert.That(mermaid).DoesNotContain("gave up");
+        await Assert.That(MyRegex11.Count(mermaid)).IsEqualTo(0);
+        await Assert.That(MyRegex12.Count(mermaid)).IsEqualTo(4);
+    }
+
+    [GeneratedRegex(@"class n\d+ truncated")]
+    private static partial Regex MyRegex11 { get; }
+
+    [GeneratedRegex(@"n\d+\[""\d")]
+    private static partial Regex MyRegex12 { get; }
+
+    /// <summary>Slots eight and above sit in the second counter word, reached through a ref conditional, so only a spec
+    /// that spends past the eighth exercises that path at all. The requirement under test here is the ninth, and the
+    /// eight before it are padding that can never occur - if the word selection were wrong it would either read a
+    /// padding slot's count or corrupt one.</summary>
+    [Test]
+    public async Task Requirements_Past_The_Eighth_Slot_Still_Count()
+    {
+        static Spec<int> Ninth(int bound)
+        {
+            var spec = Spec.From(0).Action("Inc", i => i < 6, i => i + 1);
+            for (int i = 0; i < 8; i++) spec.AtMost($"PAD{i}", "cannot occur", 3, (_, _) => false);
+            return spec.AtMost("NINTH", "at most bound increments", bound, (b, a) => a > b);
+        }
+        var ok = Ninth(6).Exhaustive();
+        await Assert.That(ok.Closed).IsTrue();
+
+        Ninth(3).Exhaustive(out var violation, writeLine: TUnitX.WriteLine);
+        await Assert.That(violation).IsNotNull();
+        await Assert.That(violation!.Id).IsEqualTo("NINTH");
+        await Assert.That(violation.Detail).Contains("more than 3 times");
+        await Assert.That(violation.Trace.Steps.Length).IsEqualTo(4);
+    }
+
+    /// <summary>Every other Sample here expects to pass, so the failure path of the random engine - detect, then hand
+    /// the trace to CsCheck to shrink - had no test at all. Five steps is the shortest way to reach five, so a sixth
+    /// step in the reported trace would mean the shrink did not finish.</summary>
+    [Test]
+    public async Task Sample_Finds_And_Shrinks_A_Violation()
+    {
+        var spec = Spec.From(0)
+            .Action("Inc", i => i < 20, i => i + 1)
+            .Never("NO-FIVE", "the counter never reaches five", (_, a) => a == 5);
+        var message = Assert.Throws<CsCheckException>(() => spec.Sample(maxSteps: 30, iter: 10_000))!.Message;
+        TUnitX.WriteLine(message);
+        await Assert.That(message).Contains("NO-FIVE");
+        await Assert.That(message).Contains(" 5 Inc");
+        await Assert.That(message).DoesNotContain(" 6 Inc");
+    }
+
+    /// <summary>The signal Faults exists for. Elsewhere the tables assert nothing escaped; this asserts that when
+    /// something does, the run fails rather than printing a NOTHING row into output no one reads.</summary>
+    [Test]
+    public async Task Faults_Throws_When_A_Defect_Escapes()
+    {
+        var lines = new List<string>();
+        var spec = Spec.From(0)
+            .Action("Inc", i => i < 5, i => i + 1)
+            .Invariant("NON-NEGATIVE", "the counter never goes negative", i => i >= 0)
+            .Fault("counter advances twice", (_, _) => true, (_, a) => a + 1);
+        var message = Assert.Throws<CsCheckException>(() => spec.Faults(lines.Add))!.Message;
+        TUnitX.WriteLine(string.Join('\n', lines));
+        await Assert.That(message).Contains("counter advances twice");
+        await Assert.That(string.Join('\n', lines)).Contains("NOTHING");
+    }
+
+    /// <summary>The Caught by column is what the examples assert on, and a fault renamed without its assertion being
+    /// updated would otherwise read as uncaught - the same green-for-the-wrong-reason failure the column exists to
+    /// catch. So an unknown name throws rather than returning null.</summary>
+    [Test]
+    public async Task CaughtBy_An_Unknown_Fault_Name_Is_Rejected()
+    {
+        // Action stops at 4, so the unfaulted spec never reaches 5. The fault jumps to 5 on any step.
+        var report = Spec.From(0).Action("Inc", i => i < 4, i => i + 1)
+            .Invariant("NON-NEGATIVE", "the counter never goes negative", i => i >= 0)
+            .Never("NO-FIVE", "the counter never reaches five", (_, a) => a == 5)
+            .Fault("counter jumps to five", (_, _) => true, (_, _) => 5)
+            .Faults(throwOnUncaught: false);
+        await Assert.That(report.CaughtBy("counter jumps to five")).IsEqualTo("NO-FIVE");
+        await Assert.That(Assert.Throws<CsCheckException>(() => report.CaughtBy("counter jumps to six"))!.Message)
+            .Contains("counter jumps to six");
+    }
+
+    /// <summary>maxDepth stops the walk short, so the space has not closed and nothing may be concluded from it.</summary>
+    [Test]
+    public async Task MaxDepth_Stops_Short_Of_Closing()
+    {
+        var report = Spec.From(0).Action("Inc", i => i < 10, i => i + 1).Exhaustive(maxDepth: 3);
+        await Assert.That(report.Closed).IsFalse();
+        await Assert.That(report.Depth).IsEqualTo(3);
+        await Assert.That(report.Note).Contains("maxDepth 3");
+        var closed = Spec.From(0).Action("Inc", i => i < 10, i => i + 1).Exhaustive();
+        await Assert.That(closed.Closed).IsTrue();
+        await Assert.That(closed.States).IsEqualTo(11);
+    }
+
+    /// <summary>Pruning happens during the sequential insert, so like everything else about Exhaustive the result does
+    /// not depend on how many threads expanded it.</summary>
+    [Test]
+    public async Task Boundary_Is_Independent_Of_Thread_Count()
+    {
+        static Spec<(int, int)> Grid() => Spec.From((0, 0))
+            .Action("X", t => (t.Item1 + 1, t.Item2))
+            .Action("Y", t => (t.Item1, t.Item2 + 1))
+            .Boundary(t => t.Item1 + t.Item2 <= 12);
+        var one = Grid().Exhaustive(threads: 1);
+        var many = Grid().Exhaustive(threads: Environment.ProcessorCount);
+        await Assert.That(many.States).IsEqualTo(one.States);
+        await Assert.That(many.Pruned).IsEqualTo(one.Pruned);
+        await Assert.That(many.ToString()).IsEqualTo(one.ToString());
+        // Distinct states outside the boundary, not transitions into them: the 14 states summing to 13, each reachable
+        // two ways. Pinned because it is a number a caller can read and the two differ by nearly a factor of two.
+        await Assert.That(one.States).IsEqualTo(91);
+        await Assert.That(one.Pruned).IsEqualTo(14);
+    }
+
+    /// <summary>Every transition fires exactly one (action, argument) case, so the coverage table's numbers have to sum
+    /// to the transition count. The thread agreement tests compare one thread against many, which catches the two
+    /// disagreeing but not a miscount present in both; this is the absolute check. It is the one that would catch the
+    /// parallel path folding its per node fired arrays in wrongly, since that path accumulates into a buffer and adds it
+    /// up afterwards rather than incrementing as it goes.
+    /// <para>Only on a run that closed. A violation stops the inserting while the rest of that node's edges are still
+    /// evaluated for coverage, and giving up at maxStates does the same, so both leave Fired ahead of Transitions by</para>
+    /// design - which is itself worth stating, because it looks like a bug until you know why.</summary>
+    [Test]
+    [Arguments(1)]
+    [Arguments(4)]
+    public async Task Action_Coverage_Sums_To_The_Transition_Count(int threads)
+    {
+        foreach (var report in new[]
+        {
+            FencingSpec.Create(FencingSpec.Fence.Every).Exhaustive(threads: threads),
+            AlternatingBitSpec.Create().Exhaustive(threads: threads),
+            RefreshCacheSpec.Create().Exhaustive(threads: threads),
+        })
+        {
+            await Assert.That(report.Closed).IsTrue();
+            var fired = 0L;
+            foreach (var f in report.ActionFired) fired += f;
+            await Assert.That(fired).IsEqualTo(report.Transitions);
+        }
+    }
+
+    /// <summary>The same arithmetic for the random walk, where it is checking something the exhaustive engine does not
+    /// have: a thread static tally per walk, flushed into the shared counters with interlocked adds. <see cref="Check.Sample{S}(Spec{S}, System.Action{string}?, int, int, string?, long, int, int)">Sample</see> runs
+    /// on every core by default, so that code is always threaded and nothing else measures whether it loses or double
+    /// counts. Every step of every trace fires exactly one case, so the sum has to be the step count, and the walk count
+    /// has to be the iterations asked for.</summary>
+    [Test]
+    [Arguments(1)]
+    [Arguments(-1)]
+    public async Task Sample_Coverage_Sums_To_The_Steps_Walked(int threads)
+    {
+        var report = FixEngineSpec.Create().Sample(iter: 500, threads: threads);
+        // At least, not exactly: CsCheck_Time replaces the count with a budget.
+        await Assert.That(report.TracesWalked >= 500).IsTrue();
+        var fired = 0L;
+        foreach (var f in report.ActionFired) fired += f;
+        await Assert.That(fired).IsEqualTo(report.StepsWalked);
+        // And the steps are the traces' own lengths, so neither counter can drift from the other.
+        await Assert.That(report.StepsWalked).IsGreaterThan(report.TracesWalked);
+    }
+}

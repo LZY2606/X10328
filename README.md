@@ -1,0 +1,815 @@
+# CsCheck
+[![CI](https://github.com/AnthonyLloyd/CsCheck/actions/workflows/main.yml/badge.svg?branch=master)](https://github.com/AnthonyLloyd/CsCheck/actions/workflows/main.yml) [![Nuget](https://img.shields.io/nuget/v/CsCheck.svg)](https://www.nuget.org/packages/CsCheck/)
+
+
+CsCheck is a C# random testing library inspired by QuickCheck.
+
+It differs in that generation and shrinking are both based on [PCG](https://www.pcg-random.org), a fast random number generator.
+
+This gives the following advantages over tree based shrinking libraries:
+
+- Automatic shrinking. Gen classes are composable with no need for Arb classes. So less boilerplate.
+- Random testing and shrinking are parallelized. This and PCG make it very fast.
+- Shrunk cases have a seed value. Simpler examples can easily be reproduced.
+- Shrinking can be continued later to give simpler cases for high-dimensional problems.
+- Parallel concurrency testing and random shrinking work well together. Repeat is not needed.
+
+New to random testing? Read the [beginner's getting started guide](https://github.com/AnthonyLloyd/CsCheck/blob/master/docs/GettingStarted.md).
+
+See [why](https://github.com/AnthonyLloyd/CsCheck/blob/master/docs/Why.md) you should use it, the [comparison](https://github.com/AnthonyLloyd/CsCheck/blob/master/docs/Comparison.md) with other random testing libraries, or how CsCheck does in the [shrinking challenge](https://github.com/jlink/shrinking-challenge).
+In one [shrinking challenge test](https://github.com/jlink/shrinking-challenge/blob/main/challenges/binheap.md) CsCheck managed to shrink to a new smaller example than was thought possible and is not reached by any other testing library.
+CsCheck is the only random testing library that can always shrink to the simplest example (given enough time).
+
+CsCheck also has functionality to make multiple types of testing simple and fast:
+
+- [Random testing](#Random-testing)
+- [Model-based testing](#Model-based-testing)
+- [Metamorphic testing](#Metamorphic-testing)
+- [Performance testing](#Performance-testing)
+- [Specification testing](#Specification-testing)
+- [Regression testing](#Regression-testing)
+- [Parallel testing](#Parallel-testing)
+- [Equality testing](#Equality-testing)
+- [Causal profiling](#Causal-profiling)
+- [Debug utilities](#Debug-utilities)
+- [Configuration](#Configuration)
+- [Development](#Development)
+
+The following tests are in ~~xUnit~~ TUnit but could equally be used in any testing framework.
+
+More to see in the [Tests](https://github.com/AnthonyLloyd/CsCheck/tree/master/Tests). There are also 1,000+ F# tests using CsCheck in [MKL.NET](https://github.com/MKL-NET/MKL.NET/tree/master/Tests).
+
+No Reflection was used in the making of this product. CsCheck is close to being AOT compatible but 'generic recursion is AOT kryptonite'.
+
+## Generator Creation Example
+
+Use **Gen** and its Linq methods to compose generators for any type. Here we create a **Gen** for json documents.
+More often it will simply be composing a few primitives and collections.
+Don't worry about shrinking as it's automatic and the best in the business.
+
+```csharp
+static readonly Gen<string> genString = Gen.String[Gen.Char.AlphaNumeric, 2, 5];
+static readonly Gen<JsonNode> genJsonValue = Gen.OneOf<JsonNode>(
+    Gen.Bool.Select(x => JsonValue.Create(x)),
+    Gen.Byte.Select(x => JsonValue.Create(x)),
+    Gen.Char.AlphaNumeric.Select(x => JsonValue.Create(x)),
+    Gen.DateTime.Select(x => JsonValue.Create(x)),
+    Gen.DateTimeOffset.Select(x => JsonValue.Create(x)),
+    Gen.Decimal.Select(x => JsonValue.Create(x)),
+    Gen.Double.Select(x => JsonValue.Create(x)),
+    Gen.Float.Select(x => JsonValue.Create(x)),
+    Gen.Guid.Select(x => JsonValue.Create(x)),
+    Gen.Int.Select(x => JsonValue.Create(x)),
+    Gen.Long.Select(x => JsonValue.Create(x)),
+    Gen.SByte.Select(x => JsonValue.Create(x)),
+    Gen.Short.Select(x => JsonValue.Create(x)),
+    genString.Select(x => JsonValue.Create(x)),
+    Gen.UInt.Select(x => JsonValue.Create(x)),
+    Gen.ULong.Select(x => JsonValue.Create(x)),
+    Gen.UShort.Select(x => JsonValue.Create(x)));
+static readonly Gen<JsonNode> genJsonNode = Gen.Recursive<JsonNode>((depth, genJsonNode) =>
+{
+    if (depth == 5) return genJsonValue;
+    var genJsonObject = Gen.Dictionary(genString, genJsonNode.Null())[0, 5].Select(d => new JsonObject(d));
+    var genJsonArray = genJsonNode.Null().Array[0, 5].Select(i => new JsonArray(i));
+    return Gen.OneOf(genJsonObject, genJsonArray, genJsonValue);
+});
+```
+
+## Random testing
+
+**Sample** is used to perform tests with a generator. Either return false or throw an exception for failure.
+**Sample** will aggressively shrink any failure down to the simplest example.  
+The default sample size is 100 iterations. Set iter: to change this or time: to run for a number of seconds.  
+Setting these from the command line can be a good way to run your tests in different ways and in Release mode.
+
+A failing **Sample** throws with a line like:
+
+```
+Set seed: "0000018ab..." or -e CsCheck_Seed=0000018ab... to reproduce (12 shrinks, 3,456 skipped, 4,000 total).
+```
+
+- **seed** - paste into `seed:` (or set environment variable `CsCheck_Seed`) to replay this exact failure.
+- **shrinks** - how many progressively smaller failing cases were found before the simplest one shown below.
+- **skipped** - shrink phase candidates that were **not smaller** than the current minimal failure, so they were never asserted.
+- **total** - total candidates generated (asserted + skipped).
+
+### Unit Single
+```csharp
+[Test]
+public void Single_Unit_Range()
+{
+    Gen.Single.Unit.Sample(f => f is >= 0f and <= 0.9999999f);
+}
+```
+
+### Long Range
+```csharp
+[Test]
+public void Long_Range()
+{
+    (from t in Gen.Select(Gen.Long, Gen.Long)
+     let start = Math.Min(t.V0, t.V1)
+     let finish = Math.Max(t.V0, t.V1)
+     from value in Gen.Long[start, finish]
+     select (value, start, finish))
+    .Sample(i => i.start <= i.value && i.value <= i.finish);
+}
+```
+
+### Int Distribution
+```csharp
+[Test]
+public void Int_Distribution()
+{
+    int buckets = 70;
+    int frequency = 10;
+    int[] expected = Enumerable.Repeat(frequency, buckets).ToArray();
+    Gen.Int[0, buckets - 1].Array[frequency * buckets]
+    .Select(sample => Tally(buckets, sample))
+    .Sample(actual => Check.ChiSquared(expected, actual));
+}
+```
+
+### Serialization Roundtrip
+```csharp
+static void TestRoundtrip<T>(Gen<T> gen, Action<Stream, T> serialize, Func<Stream, T> deserialize)
+{
+    gen.Sample(t =>
+    {
+        using var ms = new MemoryStream();
+        serialize(ms, t);
+        ms.Position = 0;
+        return deserialize(ms).Equals(t);
+    });
+}
+[Test]
+public void Varint()
+{
+    TestRoundtrip(Gen.UInt, StreamSerializer.WriteVarint, StreamSerializer.ReadVarint);
+}
+[Test]
+public void Double()
+{
+    TestRoundtrip(Gen.Double, StreamSerializer.WriteDouble, StreamSerializer.ReadDouble);
+}
+[Test]
+public void DateTime()
+{
+    TestRoundtrip(Gen.DateTime, StreamSerializer.WriteDateTime, StreamSerializer.ReadDateTime);
+}
+```
+
+### Shrinking Challenge
+```csharp
+[Test]
+public void No2_LargeUnionList()
+{
+    Gen.Int.Array.Array
+    .Sample(aa =>
+    {
+        var hs = new HashSet<int>();
+        foreach (var a in aa)
+        {
+            foreach (var i in a) hs.Add(i);
+            if (hs.Count >= 5) return false;
+        }
+        return true;
+    });
+}
+```
+
+### Recursive
+```csharp
+record MyObj(int Id, MyObj[] Children);
+
+[Test]
+public void RecursiveDepth()
+{
+    int maxDepth = 4;
+    Gen.Recursive<MyObj>((i, my) =>
+        Gen.Select(Gen.Int, my.Array[0, i < maxDepth ? 6 : 0], (i, a) => new MyObj(i, a))
+    )
+    .Sample(i =>
+    {
+        static int Depth(MyObj o) => o.Children.Length == 0 ? 0 : 1 + o.Children.Max(Depth);
+        return Depth(i) <= maxDepth;
+    });
+}
+```
+
+### Classify
+
+Change the return in **Sample** to a string to produce a summary classification table.
+All other optional parameters work the same but writeLine: is now mandatory.
+
+```csharp
+[Test]
+public void AllocatorMany_Classify()
+{
+    Gen.Select(Gen.Int[3, 30], Gen.Int[3, 15]).SelectMany((rows, cols) =>
+        Gen.Select(
+            Gen.Int[0, 5].Array[cols].Where(a => a.Sum() > 0).Array[rows],
+            Gen.Int[900, 1000].Array[rows],
+            Gen.Int.Uniform))
+    .Sample((solution,
+             rowPrice,
+             seed) =>
+    {
+        var rowTotal = Array.ConvertAll(solution, row => row.Sum());
+        var colTotal = Enumerable.Range(0, solution[0].Length).Select(col => solution.SumCol(col)).ToArray();
+        var allocation = AllocatorMany.Allocate(rowPrice, rowTotal, colTotal, new(seed), time: 1);
+        if (!TotalsCorrectly(rowTotal, colTotal, allocation.Solution))
+            throw new Exception("Does not total correctly");
+        return $"{(allocation.KnownGlobal ? "Global" : "Local")}/{allocation.SolutionType}";
+    }, TUnitX.WriteLine, time: 60, threads: 1);
+}
+```
+
+|                    | Count |       % |      Median |     Lower Q |     Upper Q |     Minimum |     Maximum |
+|--------------------|------:|--------:|------------:|------------:|------------:|------------:|------------:|
+| Global             | 2,082 |  97.79% |             |             |             |             |             |
+|   RoundingMinimum  | 1,559 |  73.23% |     0.336ms |     0.099ms |     0.907ms |     0.003ms |    21.391ms |
+|   RandomChange     |   400 |  18.79% |     1.046ms |     0.266ms |     7.659ms |     0.037ms |   626.076ms |
+|   EveryCombination |   123 |   5.78% |     4.067ms |     0.283ms |    44.982ms |     0.043ms |   975.250ms |
+| Local              |    47 |   2.21% |             |             |             |             |             |
+|   RandomChange     |    44 |   2.07% | 1,000.252ms | 1,000.192ms | 1,000.325ms | 1,000.128ms | 1,000.644ms |
+|   EveryCombination |     2 |   0.09% | 1,000.188ms |             |             |             |             |
+|   RoundingMinimum  |     1 |   0.05% | 1,000.212ms |             |             |             |             |
+
+## Model-based testing
+
+Model-based is often the most economical form of random testing.
+Only a small amount of code is needed to fully test functionality.
+SampleModelBased generates an initial actual and model, then applies a random sequence of operations to both, checking that the actual and model stay equal after each operation.
+
+### SetSlim Add
+```csharp
+[Test]
+public void
+SetSlim_ModelBased()
+{
+    Gen.Int.Array.Select(a => (new SetSlim<int>(a), new HashSet<int>(a)))
+    .SampleModelBased(
+        Gen.Int.Operation<SetSlim<int>, HashSet<int>>(
+            (ss, i) => ss.Add(i),
+            (hs, i) => hs.Add(i)
+        )
+        // ... other operations
+    );
+}
+```
+
+### Operation coverage
+
+Set `writeLine` and a table of how often each operation ran is written, which is the cheapest way to see that a random
+walk has starved one. Add `classify` over the model state and each operation is split by the state it acted on, which
+answers whether the interesting cases were reached at all or only the easy one.
+
+```csharp
+Gen.Int[0, 5].List[0, 3].Select(l => (new ConcurrentBag<int>(l), l))
+.SampleModelBased(
+    Gen.Int.Operation<ConcurrentBag<int>, List<int>>((bag, i) => bag.Add(i), (list, i) => list.Add(i)),
+    Gen.Operation<ConcurrentBag<int>, List<int>>(bag => bag.TryTake(out _), list => { if (list.Count > 0) list.RemoveAt(0); }),
+    equal: (bag, list) => bag.Count == list.Count,
+    classify: list => list.Count == 0 ? "empty" : "non-empty",
+    writeLine: Console.WriteLine);
+```
+
+|             | Count |       % |    Median |   Lower Q |   Upper Q |   Minimum |    Maximum |
+|-------------|------:|--------:|----------:|----------:|----------:|----------:|-----------:|
+| Op0         | 3,388 |  50.27% |           |           |           |           |            |
+|   non-empty | 2,907 |  43.14% |  0.1000μs |  0.0059μs |  0.1095μs |  0.0000μs | 285.6000μs |
+|   empty     |   481 |   7.14% |  0.1000μs |  0.0992μs |  0.1018μs |  0.0000μs |   2.3000μs |
+| Op1         | 3,351 |  49.73% |           |           |           |           |            |
+|   non-empty | 2,910 |  43.18% |  0.0997μs |  0.0072μs |  0.1082μs |  0.0000μs | 362.6000μs |
+|   empty     |   441 |   6.54% |  0.1000μs |  0.0300μs |  0.1001μs |  0.0000μs |   0.8000μs |
+
+Rows are named by the operation's position in the argument list, and the times are of the actual operation rather than
+the model. The initial list is bounded here because the default `List` Count is uniform over 0 to 127, so a bag starting
+near 64 with balanced adds and takes reaches empty only in the rare iteration that starts there. Nothing is written and
+nothing is measured when `writeLine` is not set.
+
+## Metamorphic testing
+
+Metamorphic testing is another economical form: doing something two different ways and checking they produce the same result.
+SampleMetamorphic generates two identical initial samples and then applies the two functions and asserts the results are equal.
+This can be needed when no model can be found that is not just a reimplementation.
+
+More about how useful metamorphic tests can be here: [How to specify it!](https://youtu.be/G0NUOst-53U?t=1639).
+
+### MapSlim Update
+```csharp
+[Test]
+public void MapSlim_Metamorphic()
+{
+    Gen.Dictionary(Gen.Int, Gen.Byte)
+    .Select(d => new MapSlim<int, byte>(d))
+    .SampleMetamorphic(
+        Gen.Select(Gen.Int[0, 100], Gen.Byte, Gen.Int[0, 100], Gen.Byte).Metamorphic<MapSlim<int, byte>>(
+            (d, t) => { d[t.V0] = t.V1; d[t.V2] = t.V3; },
+            (d, t) => { if (t.V0 == t.V2) d[t.V2] = t.V3; else { d[t.V2] = t.V3; d[t.V0] = t.V1; } }
+        )
+    );
+}
+```
+
+## Performance testing
+
+**Faster** is used to statistically test that the first method is faster than the second and some condition is satisfied (by default equality of the output of the two methods).  
+Since it's statistical and relative you can run it as a normal test anywhere e.g. across multiple platforms on a continuous integration server.  
+It's fast because it runs in parallel and knows when to stop.
+It's just what you need to iteratively improve performance while making sure it still produces the correct results.
+
+```csharp
+[Test]
+public void Faster_Linq_Random()
+{
+    Gen.Byte.Array[100, 1000]
+    .Faster(
+        data => data.Aggregate(0.0, (t, b) => t + b),
+        data => data.Select(i => (double)i).Sum(),
+        writeLine: TUnitX.WriteLine
+    );
+}
+```
+
+The performance is raised in an exception if it fails but can also be output if it passes with the above output function.
+```
+Tests.CheckTests.Faster_Linq_Random [27ms]
+Standard Output Messages:
+32.29%[29.47%..36.51%] 1.48x[1.42x..1.58x] faster, sigma = 50.0 (2,551 vs 17), min = 208ns vs 375ns, alloc = 0B vs 48B
+```
+
+ The first number is the estimated percentage median performance improvement with the interquartile range in the square brackets.
+ The second number is the estimated times median performance improvement with the interquartile range in the square brackets.
+ 33⅓% faster = 1.5x faster and 90% faster = 10x faster, take your pick.
+ The counts of faster vs slower and the corresponding sigma (the number of standard deviations of the binomial
+ distribution for the null hypothesis P(faster) = P(slower) = 0.5) are also shown. The default sigma used is 6.0.
+ The minimum time taken for faster vs slower is shown as an idea of timing and for additional diagnostics of the result (machine dependent).
+ Finally the allocation of a single call of faster vs slower is shown, measured at the end of the run (default on the measuring thread; set allocAll: true to include all threads; async Faster always measures all threads).
+
+### Matrix Multiply
+
+```csharp
+[Test]
+public void Faster_Matrix_Multiply_Range()
+{
+    var genDim = Gen.Int[5, 30];
+    var genArray = Gen.Double.Unit.Array2D;
+    Gen.SelectMany(genDim, genDim, genDim, (i, j, k) => Gen.Select(genArray[i, j], genArray[j, k]))
+    .Faster(
+        MulIKJ,
+        MulIJK
+    );
+}
+```
+
+### MapSlim Increment
+
+```csharp
+[Test]
+public void MapSlim_Performance_Increment()
+{
+    Gen.Byte.Array
+    .Select(a => (a, new MapSlim<byte, int>(), new Dictionary<int, int>()))
+    .Faster(
+        (items, mapslim, _) =>
+        {
+            foreach (var b in items)
+                mapslim.GetValueOrNullRef(b)++;
+        },
+        (items, _, dict) =>
+        {
+            foreach (var b in items)
+            {
+                dict.TryGetValue(b, out int c);
+                dict[b] = c + 1;
+            }
+        },
+        repeat: 100,
+        writeLine: TUnitX.WriteLine);
+}
+```
+
+```
+Tests.SlimCollectionsTests.MapSlim_Performance_Increment [27 s]
+Standard Output Messages:
+66.02%[56.48%..74.81%] 2.94x[2.30x..3.97x] faster, sigma = 200.0 (72,690 vs 13,853), min = 11.983ns vs 34.996ns
+```
+
+### Benchmarks Game
+```csharp
+[Test]
+public void ReverseComplement_Faster()
+{
+    if (!File.Exists(Utils.Fasta.Filename)) Utils.Fasta.NotMain(new[] { "25000000" });
+
+    Check.Faster(
+        ReverseComplementNew.RevComp.NotMain,
+        ReverseComplementOld.RevComp.NotMain,
+        threads: 1, timeout: 600_000, sigma: 6
+        writeLine: TUnitX.WriteLine);
+}
+```
+
+```
+Tests.ReverseComplementTests.ReverseComplement_Faster [27s 870ms]
+Standard Output Messages:
+25.15%[20.58%..31.60%] 1.34x[1.26x..1.46x] faster, sigma = 6.0 (36 vs 0), min = 1,453ms vs 1,942ms
+```
+
+### Varint
+Repeat is used as the functions are very quick.
+```csharp
+[Test]
+public void Varint_Faster()
+{
+    Gen.Select(Gen.UInt, Gen.Const(() => new byte[8]))
+    .Faster(
+        (i, bytes) =>
+        {
+            int pos = 0;
+            ArraySerializer.WriteVarint(bytes, ref pos, i);
+            pos = 0;
+            return ArraySerializer.ReadVarint(bytes, ref pos);
+        },
+        (i, bytes) =>
+        {
+            int pos = 0;
+            ArraySerializer.WritePrefixVarint(bytes, ref pos, i);
+            pos = 0;
+            return ArraySerializer.ReadPrefixVarint(bytes, ref pos);
+        }, sigma: 10, repeat: 200, writeLine: TUnitX.WriteLine);
+}
+```
+
+```
+Tests.ArraySerializerTests.Varint_Faster [45 ms]
+Standard Output Messages:
+10.94%[-3.27%..25.81%] 1.12x[0.97x..1.35x] faster, sigma = 10.0 (442 vs 190), min = 7.082ns vs 7.332ns, alloc = 0B vs 0B
+```
+
+## Specification testing
+
+Model-based testing needs a model to compare against. Sometimes what you have instead is a *document*: a protocol
+specification, an exchange's rules, a regulation. **Spec** lets you write the requirements down as named,
+quoted rules over a small pure state machine, and then check them four ways from the one definition.
+
+```csharp
+Spec.From(State.Connected)
+.Action("Recv", Inbound, (s, _) => s.Status != Disconnected, (s, m) => s.Inbound(m), weight: 30)
+.Action("Tick", s => s.Status != Disconnected, s => s.Tick(), weight: 20)
+.Rule("SEQ-TOO-LOW-FATAL",
+    "MsgSeqNum lower than expected without PossDupFlag set to Y is a fatal error: send a Logout and terminate.",
+    when: (b, a) => b.Up && a.RecvSeq == Seq.TooLow,
+    then: (b, a) => a.Put(Out.Logout) && a.Status == Disconnected)
+.Response("LOGOUT-COMPLETES",
+    "The initiator of a Logout waits for the confirming Logout, and terminates anyway if it does not arrive.",
+    trigger:  (b, a) => a.Status == LogoutSent && b.Status != LogoutSent,
+    response: (b, a) => a.Status == Disconnected,
+    within: Interval + 1, per: "Tick")
+.Never("DISCONNECTED-SILENT", "No message is sent on a terminated connection.",
+    (b, a) => b.Status == Disconnected && a.Sent != Out.None)
+.Reachable("CAN-LOG-ON", "A session can reach the logged on state at all.",
+    s => s.Status == LoggedOn);
+```
+
+- **`Exhaustive`** enumerates the whole reachable state space breadth first. When it closes, every requirement is
+  *proved* for the model rather than sampled, including bounded `Response` requirements, whose outstanding
+  deadlines are carried in the search state. Any violation comes back as a shortest path.
+- **`Sample`** random walks the same specification with normal CsCheck shrinking, for models too big to close.
+- **`Faults`** injects each declared defect in turn and reports which requirement caught it, and at what depth.
+  Mutation testing for the specification: a defect nothing catches means a requirement is missing, and a defect
+  caught by the *wrong* requirement means one of them is not what you thought. This is the one to reach for second:
+  a proof says the requirements hold, `Faults` says whether they were worth holding. `SampleFaults` produces the same
+  table by walking each fault instead of proving it, for a model too large to close. For `SampleFaults`, NOTHING means no requirement was seen to catch it, not that none can.
+- **`Conform`** drives a real implementation down the same walk and checks it conforms to the specification on those traces. Exhaustive proves the model. Conform checks the real object on the traces it walked.
+
+`Mermaid` returns the reachable state graph as a Mermaid flowchart, with intended ends, dead ends and cut-off states styled differently, for a model small enough to look at.
+
+Every run prints how often each requirement's `when` / `on` / `trigger` actually happened. If that never happened the row says NEVER: the check passed only because it was never in a position to fail:
+
+```
+Spec.Exhaustive of 31 requirements
+  state space CLOSED: 2,438 states, 51,569 transitions, depth 11, 131 terminal, 0 deadlock
+  | Requirement             |   Triggered | Unresolved |
+  | CAN-LOG-ON              |      13,798 |            |
+  | SEQ-TOO-LOW-FATAL       |       4,420 |            |
+  | DISCONNECTED-SILENT     |  every step |            |
+  | LOGOUT-COMPLETES        |         922 |            |
+  ...
+```
+
+(`every step` means this requirement is checked on every step. There is no `when` / `on` / `trigger` that can be missed.)
+
+Start with [Tests/Specs/SpecIntroTests.cs](Tests/Specs/SpecIntroTests.cs), an order lifecycle in one file, seven reachable
+states, small enough to check by hand. Then [docs/Spec.md](docs/Spec.md) for the seven worked examples: the FIX 4.4
+session core, a refresh-on-access cache, a distributed lease specified in three configurations to show which one is
+actually safe, and four reimplementations of published specifications: a `wait` / `notify` queue that deadlocks, the
+Alternating Bit Protocol, the LMAX Disruptor and Safra's EWD 998 termination detection, each checked against the
+original's own published results.
+
+## Regression testing
+
+### Portfolio Calculation
+**Single** is used to find, pin and continue to check a suitable generated example e.g. to cover a certain codepath.  
+**Hash** is used to find and check a hash for a number of results.  
+It saves a temp cache of the results on a successful hash check and each subsequent run will fail with actual vs expected at the first point of any difference.  
+Together **Single** and **Hash** eliminate the need to commit data files in regression testing while also giving detailed information of any change.
+
+```csharp
+[Test]
+public void Portfolio_Small_Mixed_Example()
+{
+    var portfolio = ModelGen.Portfolio.Single(p =>
+           p.Positions.Count == 5
+        && p.Positions.Any(p => p.Instrument is Bond)
+        && p.Positions.Any(p => p.Instrument is Equity)
+    , "0N0XIzNsQ0O2");
+    var currencies = portfolio.Positions.Select(p => p.Instrument.Currency).Distinct().ToArray();
+    var fxRates = ModelGen.Price.Array[currencies.Length].Single(a =>
+        a.All(p => p is > 0.75 and < 1.5)
+    , "ftXKwKhS6ec4");
+    double fxRate(Currency c) => fxRates[Array.IndexOf(currencies, c)];
+    Check.Hash(h =>
+    {
+        h.Add(portfolio.Positions.Select(p => p.Profit));
+        h.Add(portfolio.Profit(fxRate));
+        h.Add(portfolio.RiskByPosition(fxRate));
+    }, 5857230471108592669, decimalPlaces: 2);
+}
+```
+
+## Parallel testing
+
+CsCheck has support for parallel testing with full shrinking capability.
+Starting from an initial state, some operations are run sequentially and then some in parallel. The parallel result is compared against every possible linearization of those operations, and at least one must match.
+
+Idea from John Hughes [talk](https://youtu.be/1LNEWF8s1hI?t=1603) and [paper](https://github.com/AnthonyLloyd/AnthonyLloyd.github.io/raw/master/public/cscheck/finding-race-conditions.pdf). This is easier to implement with CsCheck than QuickCheck because the random shrinking does not need to repeat each step as QuickCheck does (10 times by default) to make shrinking deterministic.
+
+```csharp
+[Test]
+public void SampleParallel_ConcurrentQueue()
+{
+    Gen.Const(() => new ConcurrentQueue<int>())
+    .SampleParallel(
+        Gen.Int.Operation<ConcurrentQueue<int>>(i => $"Enqueue({i})", (q, i) => q.Enqueue(i)),
+        Gen.Operation<ConcurrentQueue<int>>("TryDequeue()", q => q.TryDequeue(out _))
+    );
+}
+```
+
+Can also be tested against a model (which doesn't need to be thread-safe):
+
+```csharp
+[Test]
+public void SampleParallelModel_ConcurrentQueue()
+{
+    Gen.Const(() => (new ConcurrentQueue<int>(), new Queue<int>()))
+    .SampleParallel(
+        Gen.Int.Operation<ConcurrentQueue<int>, Queue<int>>(i => $"Enqueue({i})", (q, i) => q.Enqueue(i), (q, i) => q.Enqueue(i)),
+        Gen.Operation<ConcurrentQueue<int>, Queue<int>>("TryDequeue()", q => q.TryDequeue(out _), q => q.TryDequeue(out _))
+    );
+}
+```
+
+## Equality testing
+
+Equality checks that a type's `Equals`, `IEquatable<T>` and `GetHashCode` are consistent for generated values: equal values compare equal both ways and share a hash code, while unequal values disagree.
+
+You can also declare the fields in the equality contract. **Compared** fields must change equality; **Ignored** fields must not. CsCheck also checks completeness: if an undeclared field affects equality, it fails.
+
+Setters can be record `with` expressions or in-place `Action`s. For declared fields, failure messages use the setter expression name. For normalized equality (rounding, tolerance, case), use a matching `IEqualityComparer` (or a generator that still produces distinct values after setting).
+
+You can pass an `IEqualityComparer<T>` as the first argument to test a comparer directly instead of the type's own equality.
+
+For unions declare each arm with `Case`. An arm's compared/ignored fields are declared against the arm payload and are only exercised on instances of that case; instances of different cases are additionally checked to compare unequal (the case discriminant is part of equality). Cases can be nested to test nested union types.
+
+```csharp
+record Account(int Id, string Note) // equality is on Id only, Note is ignored
+{
+    public virtual bool Equals(Account? other) => other is not null && Id == other.Id;
+    public override int GetHashCode() => Id.GetHashCode();
+}
+
+[Test]
+public void Equality_Fields()
+{
+    var gen =
+        from id in Gen.Int
+        from note in Gen.String
+        select new Account(id, note);
+    gen.Equality(f => f
+        .Compared((a, v) => a with { Id = v }, Gen.Int)
+        .Ignored((a, v) => a with { Note = v }, Gen.String)
+    );
+}
+
+sealed record Cat(string Name, int Whiskers)
+{
+    public bool Equals(Cat? other) => other is not null && Name == other.Name; // Whiskers ignored
+    public override int GetHashCode() => Name.GetHashCode();
+}
+
+sealed record Dog(string Name, string Breed);
+
+readonly union Pet(Cat, Dog);
+
+[Test]
+public void Equality_Fields_Union()
+{
+    Gen.OneOf(
+        Gen.Select(Gen.String, Gen.Int, (name, whiskers) => new Pet(new Cat(name, whiskers))),
+        Gen.Select(Gen.String, Gen.String, (name, breed) => new Pet(new Dog(name, breed))))
+    .Equality(f => f
+        .Case<Cat>(cf => cf
+            .Compared((c, s) => c with { Name = s }, Gen.String)
+            .Ignored((c, w) => c with { Whiskers = w }, Gen.Int))
+        .Case<Dog>(df => df
+            .Compared((d, s) => d with { Name = s }, Gen.String)
+            .Compared((d, b) => d with { Breed = b }, Gen.String)));
+}
+```
+
+## Causal profiling
+
+Causal profiling is a technique to investigate the effect of speeding up one or more concurrent regions of code.
+It shows which regions are the bottleneck and what overall performance gain could be achieved from each region.
+
+Idea from Emery Berger. My blog posts on this [here](http://anthonylloyd.github.io/blog/2019/10/11/causal-profiling).
+
+```csharp
+[Test]
+public void Fasta()
+{
+    Causal.Profile(() => FastaUtils.Fasta.NotMain(10_000_000, null)).Output(writeLine);
+}
+
+static int[] Rnds(int i, int j, ref int seed)
+{
+    var region = Causal.RegionStart("rnds");
+    var a = intPool.Rent(BlockSize1);
+    var s = a.AsSpan(0, i);
+    s[0] = j;
+    for (i = 1, j = Width; i < s.Length; i++)
+    {
+        if (j-- == 0)
+        {
+            j = Width;
+            s[i] = IM * 3 / 2;
+        }
+        else
+        {
+            s[i] = seed = (seed * IA + IC) % IM;
+        }
+    }
+    Causal.RegionEnd(region);
+    return a;
+}
+```
+
+## Debug utilities
+
+The Dbg module is a set of utilities to collect, count and output debug info, time, classify generators, define and remotely call functions, and perform in code regression during testing.
+CsCheck can temporarily be added as a reference to run in non test code.
+Note this module is only for temporary debug use and the API may change between minor versions.
+
+
+### Count, Info, Set, Get, CallAdd, Call
+```csharp
+public void Normal_Code(int z)
+{
+    Dbg.Count();
+    var d = Calc1(z).DbgSet("d");
+    Dbg.Call("helpful");
+    var c = Calc2(d).DbgInfo("c");
+    Dbg.CallAdd("test cache", () =>
+    {
+        Dbg.Info(Dbg.Get("d"));
+        Dbg.Info(cacheItems);
+    });
+}
+
+[Test]
+public void Test()
+{
+    Dbg.CallAdd("helpful", () =>
+    {
+        var d = (double)Dbg.Get("d");
+        // ...
+        Dbg.Set("d", d);
+    });
+    Normal_Code(z);
+    Dbg.Call("test cache");
+    Dbg.Output(writeLine);
+}
+```
+
+### Regression
+```csharp
+public double[] Calculation(InputData input)
+{
+    var part1 = CalcPart1(input);
+    // Add items to the regression on first pass, throw/break here if different on subsequent.
+    Dbg.Regression.Add(part1);
+    var part2 = CalcPart2(part1).DbgTee(Dbg.Regression.Add); // Tee can be used to do this inline.
+    // ...
+    return CalcFinal(partN).DbgTee(Dbg.Regression.Add);
+}
+
+[Test]
+public void Test()
+{
+    // Remove any previously saved regression data.
+    Dbg.Regression.Delete();
+
+    Calculation(InputSource1());
+
+    // End first pass save mode (only needed if second pass is in this process run).
+    Dbg.Regression.Close();
+
+    // Subsequent pass could be now or a code change and rerun (without the Delete).
+    Calculation(InputSource2());
+
+    // Check full number of items have been reconciled (optional).
+    Dbg.Regression.Close();
+}
+```
+
+### Time
+```csharp
+
+public Result CalcPart2(InputData input)
+{
+    using var time = Dbg.Time();
+    // Calc
+    time.Line();
+    // Calc more
+    time.Line();
+    // ...
+    return result;
+}
+
+
+public void LongProcess()
+{
+    using var time = Dbg.Time();
+    var part1 = CalcPart1(input);
+    time.Line();
+    var part2 = new List<Result>();
+    foreach(var item in part1)
+        part2.Add(CalcPart2(item));
+    time.Line();
+    // ...
+    return CalcFinal(partN);
+}
+
+[Test]
+public void Test()
+{
+    LongProcess();
+    Dbg.Output(writeLine);
+}
+```
+
+## Logging
+
+CsCheck now supports logging types and pass and fail results for analysis in Sample. We include a Tyche logging implementation.
+
+## Configuration
+
+Check functions accept configuration optional parameters e.g. iter: 100_000, seed: "0N0XIzNsQ0O2", print: t => string.Join(", ", t):
+
+iter - The number of iterations to run in the sample (default 100).  
+time - The number of seconds to run the sample.  
+seed - The seed to use for the first iteration.  
+threads - The number of threads to run the sample on (default number logical CPUs).  
+timeout - The timeout in seconds to use for Faster (default 60 seconds).  
+print - A function to convert the state to a string for error reporting (default Check.Print).  
+equal - A function to check if the two states are the same (default Check.Equal).  
+sigma - For Faster sigma is the number of standard deviations from the null hypothesis (default 6).  
+allocAll - For Faster count allocation on all threads (default false).  
+replay - The number of times to retry the seed to reproduce a SampleParallel fail (default 100).  
+
+Global defaults can also be set via environment variables:
+
+```powershell
+dotnet run -c Release --project Tests --no-restore --disable-logo --output Detailed --treenode-filter /*/*/GenTests/* -e CsCheck_Iter=10000
+
+dotnet run -c Release --project Tests --no-restore --disable-logo --output Detailed --treenode-filter /*/*/FloatingPointTests/* -e CsCheck_Time=10
+
+dotnet run -c Release --project Tests --no-restore --disable-logo --output Detailed --treenode-filter /*/*/*/NSum_Shuffle_Check -e CsCheck_Seed="0N0XIzNsQ0O2"
+
+dotnet run -c Release --project Tests --no-restore --disable-logo --output Detailed --treenode-filter /*/*/*/*_Faster -e CsCheck_Sigma=50
+
+dotnet run -c Release --project Tests --no-restore --disable-logo --output Detailed --treenode-filter /*/*/*/*_Perf -e CsCheck_Threads=1
+```
+
+## Development
+
+Contributions are very welcome!
+
+CsCheck was designed to be easily extended. If you have created a cool `Gen` or extension, please consider a PR.
+
+Apache 2 and free forever.

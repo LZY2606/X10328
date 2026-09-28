@@ -1,0 +1,190 @@
+namespace Tests;
+
+using System.Diagnostics.CodeAnalysis;
+using CsCheck;
+using TUnit.Assertions.Extensions;
+
+public class SieveLruCacheTests
+{
+    [Test]
+    public async Task ExampleEvictsTail()
+    {
+        var cache = new SieveLruCache<char, int>(3);
+        var i = 0;
+        int UsedFactory(char _) => i++;
+        cache.GetOrAdd('A', UsedFactory);
+        cache.GetOrAdd('B', UsedFactory);
+        cache.GetOrAdd('C', UsedFactory);
+        cache.GetOrAdd('D', UsedFactory);
+        await Assert.That(cache.Keys.ToDictionary(k => k, k => cache.TryGetValue(k, out var v) ? v : 999))
+            .Contains(KeyValuePair.Create('B', 1))
+            .Contains(KeyValuePair.Create('C', 2))
+            .Contains(KeyValuePair.Create('D', 3))
+            .Count().IsEqualTo(3);
+    }
+
+    [Test]
+    public async Task ExampleEvictsHead()
+    {
+        var cache = new SieveLruCache<int, int>(4);
+        var i = 0;
+        int UsedFactory(int _) => i++;
+        int NotUsedFactory(int _) => throw new Exception();
+        cache.GetOrAdd(1, UsedFactory);
+        cache.GetOrAdd(4, UsedFactory);
+        cache.GetOrAdd(1, NotUsedFactory);
+        cache.GetOrAdd(3, UsedFactory);
+        cache.GetOrAdd(2, UsedFactory);
+        cache.GetOrAdd(3, NotUsedFactory);
+        cache.GetOrAdd(4, NotUsedFactory);
+        cache.GetOrAdd(5, UsedFactory);
+        cache.GetOrAdd(1, NotUsedFactory);
+        cache.GetOrAdd(2, UsedFactory);
+        await Assert.That(cache.Keys.ToDictionary(k => k, k => cache.TryGetValue(k, out var v) ? v : 999))
+            .Contains(KeyValuePair.Create(1, 0))
+            .Contains(KeyValuePair.Create(2, 5))
+            .Contains(KeyValuePair.Create(3, 2))
+            .Contains(KeyValuePair.Create(5, 4))
+            .Count().IsEqualTo(4);
+    }
+
+    [Test]
+    public async Task ExampleBlog()
+    {
+        var cache = new SieveLruCache<char, int>(7);
+        var i = 0;
+        int UsedFactory(char _) => i++;
+        int NotUsedFactory(char _) => throw new Exception();
+        // set up initial state
+        cache.GetOrAdd('A', UsedFactory);
+        cache.GetOrAdd('B', UsedFactory);
+        cache.GetOrAdd('C', UsedFactory);
+        cache.GetOrAdd('D', UsedFactory);
+        cache.GetOrAdd('B', NotUsedFactory);
+        cache.GetOrAdd('E', UsedFactory);
+        cache.GetOrAdd('F', UsedFactory);
+        cache.GetOrAdd('G', UsedFactory);
+        cache.GetOrAdd('A', NotUsedFactory);
+        cache.GetOrAdd('G', NotUsedFactory);
+        // requests
+        cache.GetOrAdd('H', UsedFactory);
+        cache.GetOrAdd('A', NotUsedFactory);
+        cache.GetOrAdd('D', NotUsedFactory);
+        cache.GetOrAdd('I', UsedFactory);
+        cache.GetOrAdd('B', NotUsedFactory);
+        cache.GetOrAdd('J', UsedFactory);
+        await Assert.That(cache.Keys.ToDictionary(k => k, k => cache.TryGetValue(k, out var v) ? v : 999))
+            .Contains(KeyValuePair.Create('A', 0))
+            .Contains(KeyValuePair.Create('B', 1))
+            .Contains(KeyValuePair.Create('D', 3))
+            .Contains(KeyValuePair.Create('G', 6))
+            .Contains(KeyValuePair.Create('H', 7))
+            .Contains(KeyValuePair.Create('I', 8))
+            .Contains(KeyValuePair.Create('J', 9))
+            .Count().IsEqualTo(7);
+    }
+
+    [Test]
+    public void SampleModelBased()
+    {
+        Check.SampleModelBased(
+            Gen.Const(() => (new SieveLruCache<int, int>(4), new SieveModel<int, int>(4))),
+            Gen.Int[1, 5].Operation<SieveLruCache<int, int>, SieveModel<int, int>>(
+                (a, i) => a.GetOrAdd(i, i => i),
+                (m, i) => m.GetOrAdd(i, i => i)),
+            equal: (a, m) => Check.Equal(a.Keys.ToHashSet(), [.. m.Keys]),
+            printActual: a => Check.Print(a.Keys),
+            printModel: m => Check.Print(m.Keys)
+        );
+    }
+}
+
+internal static class SieveLruCacheExtensions
+{
+    public static V GetOrAdd<K, V>(this ICache<K, V> cache, K key, Func<K, V> factory) where K : notnull
+    {
+        if (!cache.TryGetValue(key, out var value))
+        {
+            value = factory(key);
+            cache.Set(key, value);
+        }
+        return value;
+    }
+}
+
+public class SieveModel<K, V>(int capacity) : ICache<K, V> where K : notnull
+{
+    class Node(K key, V value)
+    {
+        public Node? Next, Prev;
+        public readonly K Key = key;
+        public V Value = value;
+        public volatile bool Visited;
+    }
+
+    private readonly Dictionary<K, Node> _dictionary = [];
+    private Node? head, hand, tail;
+
+    private void Evict()
+    {
+        var node = hand ?? tail;
+        while (node!.Visited)
+        {
+            node.Visited = false;
+            node = node.Prev ?? tail;
+        }
+        hand = node.Prev;
+        _dictionary.Remove(node.Key);
+        RemoveNode(node);
+    }
+
+    private void RemoveNode(Node node)
+    {
+        if (node.Prev is not null)
+            node.Prev.Next = node.Next;
+        else
+            head = node.Next;
+        if (node.Next is not null)
+            node.Next.Prev = node.Prev;
+        else
+            tail = node.Prev;
+    }
+
+    private void AddToHead(Node node)
+    {
+        node.Next = head;
+        head?.Prev = node;
+        head = node;
+        tail ??= node;
+    }
+
+    public void Set(K key, V value)
+    {
+        if (_dictionary.TryGetValue(key, out var node))
+        {
+            node.Value = value;
+        }
+        else
+        {
+            node = new Node(key, value);
+            if (_dictionary.Count == capacity) Evict();
+            AddToHead(node);
+            _dictionary.Add(key, node);
+        }
+    }
+
+    public bool TryGetValue(K key, [MaybeNullWhen(false)] out V value)
+    {
+        if (_dictionary.TryGetValue(key, out var node))
+        {
+            node.Visited = true;
+            value = node.Value;
+            return true;
+        }
+        value = default;
+        return false;
+    }
+
+    public int Count => _dictionary.Count;
+    public IEnumerable<K> Keys => _dictionary.Keys;
+}

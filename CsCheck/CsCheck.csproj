@@ -1,0 +1,56 @@
+﻿<Project Sdk="Microsoft.NET.Sdk">
+    <PropertyGroup>
+        <Description>
+CsCheck is a C# random testing library inspired by QuickCheck.
+
+It differs in that generation and shrinking are both based on PCG, a fast random number generator.
+
+This gives the following advantages:
+
+- Automatic shrinking. Gen classes are composable with no need for Arb classes. So less boilerplate.
+- Random testing and shrinking are parallelized. This and PCG make it very fast.
+- Shrunk cases have a seed value. Simpler examples can easily be reproduced.
+- Shrinking can be continued later to give simpler cases for high dimensional problems.
+- Parallel concurrency testing and random shrinking work well together.
+
+CsCheck also makes specification, performance and regression testing simple and fast.
+        </Description>
+        <Authors>Anthony Lloyd</Authors>
+        <Owners>Anthony Lloyd</Owners>
+        <Copyright>Copyright 2026</Copyright>
+        <PackageLicenseExpression>Apache-2.0</PackageLicenseExpression>
+        <PackageProjectUrl>http://github.com/AnthonyLloyd/CsCheck</PackageProjectUrl>
+        <PackageIcon>CsCheck.png</PackageIcon>
+        <PackageTags>quickcheck;random;model-based;metamorphic;specification;model-checking;temporal;parallel;performance;causal-profiling;regression;testing</PackageTags>
+        <Version>4.9.1</Version>
+        <PackageReleaseNotes>
+Fixed Spec mermaid { } encoding.
+Added Spec.Fault on action name parameters overload.
+Added Spec.Conform apply string? reason return instead of bool.
+        </PackageReleaseNotes>
+        <TargetFramework>net8.0</TargetFramework>
+        <LangVersion>preview</LangVersion>
+        <TreatWarningsAsErrors>true</TreatWarningsAsErrors>
+        <WarningLevel>9999</WarningLevel>
+        <Nullable>enable</Nullable>
+        <ImplicitUsings>enable</ImplicitUsings>
+        <SignAssembly>true</SignAssembly>
+        <DelaySign>false</DelaySign>
+        <AssemblyOriginatorKeyFile>../SigningKey.snk</AssemblyOriginatorKeyFile>
+        <GenerateDocumentationFile>true</GenerateDocumentationFile>
+        <PublishRepositoryUrl>true</PublishRepositoryUrl>
+        <EmbedUntrackedSources>true</EmbedUntrackedSources>
+        <ContinuousIntegrationBuild>true</ContinuousIntegrationBuild>
+        <IncludeSymbols>true</IncludeSymbols>
+        <SymbolPackageFormat>snupkg</SymbolPackageFormat>
+        <NoWarn>CS1591,MA0143</NoWarn>
+        <PackageReadmeFile>README.md</PackageReadmeFile>
+        <AnalysisMode>All</AnalysisMode>
+    </PropertyGroup>
+    <ItemGroup>
+        <PackageReference Include="Microsoft.SourceLink.GitHub" Version="10.0.401" PrivateAssets="All" />
+        <PackageReference Include="Meziantou.Analyzer" Version="3.0.261" PrivateAssets="All" />
+        <None Include="../CsCheck.png" Pack="true" PackagePath="" Visible="False" />
+        <None Include="../README.md" Pack="true" PackagePath="" Visible="False" />
+    </ItemGroup>
+</Project>

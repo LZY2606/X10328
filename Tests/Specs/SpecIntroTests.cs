@@ -1,0 +1,211 @@
+namespace Tests.Specs;
+
+using System.Text.RegularExpressions;
+using System.Threading.Tasks;
+using CsCheck;
+
+/// <summary>An introduction to <c>Spec</c>, in one file. The subject is the state machine everyone has written: an
+/// order that gets paid, shipped and delivered, or cancelled and refunded. It usually lives in a table on a wiki page
+/// and gets implemented as a switch, and it always has a hole in it somewhere.
+/// <para>Nothing here needs abstracting. The state is a three field record and the space closes at seven states and six
+/// transitions, so you can check the tool's answer by hand - which is the point of reading this one first.</para>
+/// <para>The worked examples that follow this one (FixEngine, RefreshCache, Fencing, BlockingQueue, AlternatingBit,
+/// Disruptor, TerminationDetection) are where the technique gets
+/// interesting and where the abstraction choices start to matter.</para></summary>
+public partial class SpecIntroTests
+{
+    public enum Status { New, Paid, Shipped, Delivered, Cancelled }
+
+    /// <summary>The model state. It must be immutable with value equality - a record or record struct - because
+    /// <see cref="Check.Exhaustive{S}(Spec{S}, int, int, int, bool, System.Action{string}?)">Exhaustive</see> compares and hashes states to know when it has seen one before. Money is one unit, so
+    /// <c>Paid</c> and <c>Refunded</c> are 0 or 1: the requirements below are about the relationship between them,
+    /// not about the amount - except REFUND-IS-ONE-STEP, which turns out to be about the amount after all. Give
+    /// <c>Pay</c> two amounts and it is false in three steps. docs/Spec.md works that through, because choosing a
+    /// domain that could falsify the requirement rather than one that looks realistic is most of the skill.</summary>
+    public readonly record struct Order(Status Status, int Paid, int Refunded)
+    {
+        public bool Settled => Refunded == Paid;
+
+        public override string ToString() => $"{Status,-9} paid={Paid} refunded={Refunded}";
+    }
+
+    /// <summary>The specification. Actions say what can happen and when; requirements say what must be true when it
+    /// does. The guards are the state machine - there is no separate transition table.</summary>
+    static Spec<Order> Create(bool refundable = true)
+        => Spec.From(new Order(Status.New, 0, 0))
+        .Print(o => o.ToString())
+
+        .Action("Pay", o => o.Status == Status.New,
+            o => o with { Status = Status.Paid, Paid = 1 })
+        .Action("Ship", o => o.Status == Status.Paid,
+            o => o with { Status = Status.Shipped })
+        .Action("Deliver", o => o.Status == Status.Shipped,
+            o => o with { Status = Status.Delivered })
+        .Action("Cancel", o => o.Status is Status.New or Status.Paid,
+            o => o with { Status = Status.Cancelled })
+        .Action("Refund", o => refundable && o.Status == Status.Cancelled && o.Refunded < o.Paid,
+            o => o with { Refunded = o.Refunded + 1 })
+
+        // Where the order is meant to end up. Anything else with nothing left to do is a dead end the design did not
+        // intend, and Exhaustive reports it without a requirement being written for it.
+        .Terminal(o => o.Status == Status.Delivered || (o.Status == Status.Cancelled && o.Settled))
+
+        // Must hold in every reachable state.
+        .Invariant("NO-OVER-REFUND",
+            "Never refund more than was paid.",
+            o => o.Refunded <= o.Paid)
+
+        // Must hold in at least one reachable state. The dual of an invariant, and the one requirement that catches a
+        // model so over-constrained that everything else passes because nothing interesting can happen.
+        .Reachable("CAN-DELIVER",
+            "A happy path exists: an order can be paid, shipped and delivered.",
+            o => o.Status == Status.Delivered)
+        .Reachable("CAN-REFUND",
+            "A paid order can be cancelled and the money returned.",
+            o => o.Status == Status.Cancelled && o.Paid == 1 && o.Refunded == 1)
+
+        // Must never be true of any step. Both states are available, so a requirement can talk about what changed.
+        .Never("NO-SHIP-UNPAID",
+            "Goods only leave once the money has arrived.",
+            (_, after) => after.Status is Status.Shipped or Status.Delivered && after.Paid == 0)
+        .Never("NO-CANCEL-AFTER-SHIP",
+            "Once goods are on their way the order cannot be cancelled; that is a return, not a cancellation.",
+            (before, after) => before.Status is Status.Shipped or Status.Delivered && after.Status == Status.Cancelled)
+        .Never("NO-MONEY-VANISHING",
+            "What the customer paid is never quietly forgotten. It is refunded or it is kept, never dropped.",
+            (before, after) => after.Paid < before.Paid)
+
+        // Whenever this action runs, this must hold over that step.
+        .Rule("REFUND-IS-ONE-STEP",
+            "A refund settles the order in a single movement of money.",
+            on: "Refund",
+            then: (before, after) => after.Refunded == before.Refunded + 1 && after.Settled)
+
+        // Deliberate defects, so the requirements above can be shown to be strong enough to catch something.
+        .Fault("payment is not recorded", on: "Pay",
+            perturb: (before, after) => after with { Paid = before.Paid })
+        .Fault("cancelling discards the payment", on: "Cancel",
+            perturb: (_, after) => after with { Paid = 0 })
+        .Fault("refund pays out twice", on: "Refund",
+            perturb: (before, after) => after with { Refunded = before.Refunded + 2 })
+        .Fault("cancel is allowed too late", on: "Deliver",
+            perturb: (_, after) => after with { Status = Status.Cancelled })
+        .Fault("refund does not settle the order", on: "Refund",
+            perturb: (before, after) => after with { Refunded = before.Refunded });
+
+    /// <summary>Enumerate every reachable state and check every requirement on every transition out of every one of
+    /// them. When the frontier empties the state space is closed, so this is a proof for the model rather than a
+    /// sample of it, and the report is the certificate.
+    /// <para>Read the report as well as the assertions. Triggered says how often each requirement's when / on / trigger actually
+    /// fired - a NEVER there means the requirement passed without ever being checked and proves nothing.</para></summary>
+    [Test]
+    public async Task Exhaustive_Proof()
+    {
+        var report = Create().Exhaustive(writeLine: TUnitX.WriteLine);
+        await Assert.That(report.Closed).IsTrue();
+        await Assert.That(report.DeadlockStates).IsEqualTo(0);
+        await Assert.That(report.NeverTriggered).IsEmpty();
+        await Assert.That(report.NeverFired).IsEmpty();
+        // Pin the size of the space too. Every assertion above has the form "no counterexample was found", which a
+        // search that explored too little also satisfies, so on its own a change that dropped a whole class of
+        // successor would leave this green while proving less. Small enough here to check by hand.
+        await Assert.That(report.States).IsEqualTo(7);
+        await Assert.That(report.Transitions).IsEqualTo(6);
+    }
+
+    /// <summary>Mutation testing for the specification itself. Each planted defect is injected in turn and the state
+    /// space re-explored, and the table says which requirement caught it and in how few steps. A defect that nothing
+    /// catches means a requirement is missing; a defect caught by a different requirement than you expected means the
+    /// defect or the requirement is not what you thought.</summary>
+    [Test]
+    public void Faults_Are_All_Caught()
+    {
+        Create().Faults(TUnitX.WriteLine);
+    }
+
+    /// <summary>Forget to let a cancelled order be refunded - an omission, not a wrong answer - and a paid order that
+    /// is cancelled can reach a state it can never leave with the customer's money still held.
+    /// <para>Two independent signals catch it. CAN-REFUND is now provably unreachable, because the state space closed
+    /// without it ever holding; that is what Reachable is for. And the deadlock count is 1, which costs no requirement
+    /// at all - Exhaustive knows which states have nothing enabled, and Terminal said which of those were intended.
+    /// The second signal is the more interesting one, because nobody writes a requirement for a transition they forgot.</para>
+    /// <para>Refund and REFUND-IS-ONE-STEP report NEVER here, which is correct: with the action disabled there is nothing
+    /// for them to do. That is what the coverage table is for.</para></summary>
+    [Test]
+    public async Task Missing_Transition_Is_A_Dead_End()
+    {
+        var report = Create(refundable: false).Exhaustive(out var violation, writeLine: TUnitX.WriteLine);
+        await Assert.That(report.Closed).IsTrue();
+        await Assert.That(report.DeadlockStates).IsEqualTo(1);
+        await Assert.That(violation).IsNotNull();
+        await Assert.That(violation!.Id).IsEqualTo("CAN-REFUND");
+        // The count says a dead end exists; DeadlockTrace says which one, and it is the whole point of the example -
+        // a cancelled order still holding the money, with nothing left to do.
+        await Assert.That(report.DeadlockTrace).IsNotNull();
+        await Assert.That(report.DeadlockTrace).Contains("Cancelled paid=1 refunded=0");
+        await Assert.That(report.DeadlockTrace).Contains("no action enabled");
+        // The wrong turn named rather than left to be inferred: the step that took Cancel could have taken Ship.
+        await Assert.That(report.DeadlockTrace).Contains("Cancel  or Ship");
+    }
+
+    /// <summary>Seven states is small enough to look at, so this is the one example where a picture beats a table.
+    /// <c>Mermaid</c> draws the reachable graph directly in Markdown. The dead end in the version without a
+    /// refund is highlighted as a deadlock rather than as terminal, which is the whole finding of the test above,
+    /// visible at a glance.</summary>
+    [Test]
+    public async Task State_Graph_As_Mermaid()
+    {
+        var mermaid = Create().Mermaid();
+        TUnitX.WriteLine(mermaid);
+        await Assert.That(mermaid).StartsWith("flowchart LR");
+        // Seven nodes and six edges, matching the proof, and three intended ends highlighted: delivered, cancelled
+        // after a refund, and cancelled before paying - which is settled too, and which reading the picture corrected.
+        await Assert.That(MyRegex.Count(mermaid)).IsEqualTo(7);
+        await Assert.That(MyRegex1.Count(mermaid)).IsEqualTo(6);
+        await Assert.That(MyRegex2.Count(mermaid)).IsEqualTo(3);
+        await Assert.That(MyRegex3.Count(mermaid)).IsEqualTo(0);
+
+        // Without the refund the cancelled order is a dead end, so it is highlighted as a deadlock instead.
+        var stuck = Create(refundable: false).Mermaid();
+        TUnitX.WriteLine(stuck);
+        await Assert.That(MyRegex4.Count(stuck)).IsEqualTo(1);
+    }
+
+    [GeneratedRegex(@"n\d+\[""(New|Paid|Shipped|Delivered|Cancelled)")]
+    private static partial Regex MyRegex { get; }
+
+    [GeneratedRegex(" -->\\|")]
+    private static partial Regex MyRegex1 { get; }
+
+    [GeneratedRegex(@"class n\d+ terminal")]
+    private static partial Regex MyRegex2 { get; }
+
+    [GeneratedRegex(@"class n\d+ deadlock")]
+    private static partial Regex MyRegex3 { get; }
+
+    [GeneratedRegex(@"class n\d+ deadlock")]
+    private static partial Regex MyRegex4 { get; }
+
+    /// <summary>docs/Spec.md shows this graph twice, once as the text the call returns and once as the diagram a
+    /// Markdown renderer makes of it, so both copies have to be what the call returns now.</summary>
+    [Test]
+    public async Task Docs_Quote_The_Generated_State_Graph()
+    {
+        var stuck = Create(refundable: false).Mermaid();
+        // Matched on the generator's own opening lines, not on "flowchart", so a hand drawn diagram elsewhere in the
+        // guide is neither mistaken for this one nor able to hide a copy of it that has fallen behind.
+        var head = string.Join('\n', stuck.Split('\n')[..2]);
+        var quoted = Docs.Spec.Where(b => b.StartsWith(head, StringComparison.Ordinal)).ToArray();
+        await Assert.That(quoted.Length).IsEqualTo(2);
+        foreach (var block in quoted) await Assert.That(block).IsEqualTo(stuck);
+    }
+
+    /// <summary>The same specification as a random walk. For a model this small it adds nothing over the proof, but it
+    /// is what you fall back on when a model is too large to close, and it needs no change to the specification.</summary>
+    [Test]
+    public async Task Sample()
+    {
+        var report = Create().Sample(TUnitX.WriteLine, maxSteps: 12, iter: 5_000);
+        await Assert.That(report.NeverTriggered).IsEmpty();
+    }
+}
